@@ -11,7 +11,10 @@ if [ -n "${NH_EVENT_FILE:-}" ]; then
     fi
 fi
 
-addresses=$(/usr/sbin/ip -j address show)
+uptime_seconds() {
+    read -r uptime _ < /proc/uptime
+    printf '%s\n' "${uptime%%.*}"
+}
 
 interface_address() {
     printf '%s\n' "$addresses" | /usr/bin/jq -er --arg device "$1" --arg type "$2" '
@@ -98,11 +101,25 @@ sync_record() {
         printf 'ddns: no eligible address for %s on %s\n' "$name" "$device"
         return 0
     fi
+    remaining=$((deadline - $(uptime_seconds)))
+    if [ "$remaining" -le 0 ]; then
+        printf 'ddns: request budget exhausted for %s\n' "$name" >&2
+        return 1
+    fi
+    request_timeout=7
+    if [ "$remaining" -lt "$request_timeout" ]; then request_timeout=$remaining; fi
     endpoint="$api/zones/$zone/dns_records/$record"
     payload=$(/usr/bin/jq -n --arg address "$address" '{content:$address}') || return 1
-    response=$(/usr/bin/curl --silent --show-error --fail --proto '=https' --connect-timeout 3 --max-time 7 \
+    response=$(/usr/bin/curl --silent --show-error --fail --proto '=https' --connect-timeout 3 --max-time "$request_timeout" \
         --header "@$header_file" --header 'Content-Type: application/json' \
-        --request PATCH --data "$payload" "$endpoint") || return 1
+        --request PATCH --data "$payload" "$endpoint") || {
+        curl_status=$?
+        printf 'ddns: request failed for %s curl_exit=%s\n' "$name" "$curl_status" >&2
+        case "$curl_status" in
+            6|7|28) retry_needed=1 ;;
+        esac
+        return 1
+    }
     if ! printf '%s\n' "$response" | /usr/bin/jq -e '.success == true' >/dev/null; then
         printf 'ddns: Cloudflare update failed for %s\n' "$name" >&2
         return 1
@@ -110,7 +127,25 @@ sync_record() {
     printf 'ddns: updated %s %s\n' "$record_type" "$name"
 }
 
-status=0
-sync_record A ppp-uplink_a uplink-a.example.com ZONE_ID RECORD_A_ID || status=1
-sync_record AAAA wan0 uplink-b.example.com ZONE_ID RECORD_AAAA_ID || status=1
-exit "$status"
+run_records() {
+    sync_record A ppp-uplink_a uplink-a.example.com ZONE_ID RECORD_A_ID || status=1
+    sync_record AAAA wan0 uplink-b.example.com ZONE_ID RECORD_AAAA_ID || status=1
+}
+
+deadline=$(($(uptime_seconds) + 25))
+attempt=1
+while :; do
+    addresses=$(/usr/sbin/ip -j address show)
+    status=0
+    retry_needed=0
+    run_records
+    if [ "$retry_needed" = 0 ]; then exit "$status"; fi
+    remaining=$((deadline - $(uptime_seconds)))
+    if [ "$remaining" -le 2 ]; then
+        printf 'ddns: retry budget exhausted for %s\n' "${NH_DEVICE:-all}" >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    printf 'ddns: retrying %s in 2 seconds attempt=%s\n' "${NH_DEVICE:-all}" "$attempt" >&2
+    /bin/sleep 2
+done

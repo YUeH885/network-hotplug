@@ -30,7 +30,9 @@ sync_record AAAA wan0 host.example.com ZONE_ID RECORD_AAAA_ID 254 2001:db8:100:1
 
 启动时在设备名为空的命名空间恢复调用中更新全部记录。设备地址记录按对应地址族的地址集合和属性变化处理；IPv6 DAD 完成、deprecated 状态和 preferred 属性变化后重新选择地址。PD 记录通过 `changes.pd_routes` 与接口存在性变化重新选择前缀，候选优先级改变时也执行同步。相同地址续租产生的 lifetime 更新由触发器单独标记。默认路由变化、接口启用或 carrier 恢复后，重新同步该 WAN 的记录；地址先出现、出口路由后就绪的冷启动流程由后续路由事件恢复。`SIGHUP` 手工核对与通知丢失后的恢复调用也同步当前记录。
 
-脚本直接 PATCH 记录的 `content`，每次符合条件的调用执行一次更新。Cloudflare 的部分更新接口见 [Update DNS Record](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/edit/)。每个 HTTP 请求的连接超时为 3 秒，总超时为 7 秒；记录失败后继续处理其他记录，脚本最终返回非零状态。
+脚本直接 PATCH 记录的 `content`。Cloudflare 的部分更新接口见 [Update DNS Record](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/edit/)。每个 HTTP 请求的连接超时为 3 秒，总超时最多为 7 秒。每次脚本调用共用 25 秒请求与重试窗口，使用 `/proc/uptime` 计时，请求超时随剩余时间缩短，以适配触发器的 30 秒脚本超时。
+
+DNS 解析失败、连接建立失败或超时时，先继续处理其他记录，再等待 2 秒并重新读取当前地址与 PD，同步本次事件选中的记录。重试直接在脚本内执行，成功或预算耗尽后退出；HTTP 拒绝、Cloudflare 返回失败及地址选择错误按本轮失败处理。日志包含失败记录、curl 退出码、重试次数与预算耗尽原因，最终失败返回非零状态。重试期间，后续网络通知由触发器接收并合并，当前调用结束后继续分发。
 
 凭据保存为 `/etc/network-hotplug.d/cloudflare-header`，文件内容为：
 

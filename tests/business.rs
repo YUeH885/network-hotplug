@@ -103,7 +103,8 @@ impl Ddns {
             .replace(
                 "/usr/sbin/ip",
                 &directory.path().join("ip").display().to_string(),
-            );
+            )
+            .replace("/bin/sleep 2", "/bin/sleep 0");
         fs::write(directory.path().join("ddns.sh"), script).unwrap();
         let lab = Self {
             directory,
@@ -155,6 +156,40 @@ impl Ddns {
             .env("NH_EVENT_FILE", path)
             .output()
             .unwrap()
+    }
+
+    fn curl_failures(&self, count: usize, exit: i32, after_failure: &str) {
+        let wrapper = self.directory.path().join("curl");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ncount=0\n[ ! -f '{0}/attempts' ] || count=$(cat '{0}/attempts')\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{0}/attempts'\nif [ \"$count\" -le {count} ]; then\n{after_failure}\nexit {exit}\nfi\nexec /usr/bin/curl \"$@\"\n",
+                self.directory.path().display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = self.directory.path().join("ddns.sh");
+        fs::write(
+            &script,
+            fs::read_to_string(&script)
+                .unwrap()
+                .replace("/usr/bin/curl", &wrapper.display().to_string()),
+        )
+        .unwrap();
+    }
+
+    fn fake_clock(&self) {
+        let clock = self.directory.path().join("clock");
+        fs::write(&clock, "1000\n").unwrap();
+        let script = self.directory.path().join("ddns.sh");
+        fs::write(
+            &script,
+            fs::read_to_string(&script)
+                .unwrap()
+                .replace("/proc/uptime", &clock.display().to_string()),
+        )
+        .unwrap();
     }
 }
 
@@ -445,4 +480,145 @@ fn ddns_cold_start_without_addresses_follows_later_readiness() {
         .success()
     );
     assert_eq!(lab.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn ddns_retries_dns_failure_without_another_event() {
+    let lab = Ddns::new(false);
+    lab.curl_failures(2, 6, "");
+    let result = lab.run("ppp-uplink_a", "kernel", json!({"ipv4":true}));
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(lab.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(lab.directory.path().join("attempts")).unwrap(),
+        "3\n"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("retrying ppp-uplink_a"));
+}
+
+#[test]
+fn ddns_retry_reads_the_current_address_and_pd() {
+    for pd in [false, true] {
+        let lab = Ddns::new(false);
+        let (device, changes, after_failure, expected) = if pd {
+            lab.use_pd();
+            lab.routes(json!([{"dst":"2001:db8:40::/64","dev":"wan0"}]));
+            (
+                "wan0",
+                json!({"pd_routes":true}),
+                format!(
+                    "printf '%s\\n' '{{\"dst\":\"2001:db8:50::/64\",\"dev\":\"wan0\"}}' | /usr/bin/jq -s . > '{}/routes'",
+                    lab.directory.path().display()
+                ),
+                "2001:db8:50:0:0:0:0:5",
+            )
+        } else {
+            let mut addresses = default_addresses();
+            addresses[0]["addr_info"][0]["local"] = json!("192.0.2.6");
+            (
+                "ppp-uplink_a",
+                json!({"ipv4":true}),
+                format!(
+                    "printf '%s\\n' '{}' > '{}/addresses'",
+                    addresses,
+                    lab.directory.path().display()
+                ),
+                "192.0.2.6",
+            )
+        };
+        lab.curl_failures(1, 28, &after_failure);
+        let result = lab.run(device, "kernel", changes);
+        assert!(result.status.success(), "{result:?}");
+        assert_eq!(
+            lab.requests.lock().unwrap()[0]["payload"]["content"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn ddns_retry_stops_after_address_disappears() {
+    let lab = Ddns::new(false);
+    lab.curl_failures(
+        1,
+        7,
+        &format!(
+            "printf '[]\\n' > '{}/addresses'",
+            lab.directory.path().display()
+        ),
+    );
+    assert!(
+        lab.run("ppp-uplink_a", "kernel", json!({"ipv4":true}))
+            .status
+            .success()
+    );
+    assert!(lab.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        fs::read_to_string(lab.directory.path().join("attempts")).unwrap(),
+        "1\n"
+    );
+}
+
+#[test]
+fn ddns_retry_budget_is_shared_and_http_rejection_is_final() {
+    for (exit, expected) in [(6, "5\n"), (22, "1\n")] {
+        let lab = Ddns::new(false);
+        lab.fake_clock();
+        lab.curl_failures(
+            99,
+            exit,
+            &format!(
+                "now=$(cat '{0}/clock')\nprintf '%s\\n' \"$((now + 5))\" > '{0}/clock'",
+                lab.directory.path().display()
+            ),
+        );
+        let result = lab.run("ppp-uplink_a", "kernel", json!({"ipv4":true}));
+        assert!(!result.status.success());
+        assert!(lab.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(lab.directory.path().join("attempts")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stderr).contains("retry budget exhausted"),
+            exit == 6
+        );
+    }
+}
+
+#[test]
+fn ddns_multiple_records_share_the_request_deadline() {
+    let lab = Ddns::new(false);
+    lab.fake_clock();
+    lab.curl_failures(
+        99,
+        28,
+        &format!(
+            "previous=\nfor argument do\nif [ \"$previous\" = --max-time ]; then request_timeout=$argument; fi\nprevious=$argument\ndone\nprintf '%s\\n' \"$request_timeout\" >> '{0}/timeouts'\nnow=$(cat '{0}/clock')\nprintf '%s\\n' \"$((now + request_timeout))\" > '{0}/clock'",
+            lab.directory.path().display()
+        ),
+    );
+    let result = lab.run("", "startup", json!({}));
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("retry budget exhausted"));
+    assert_eq!(
+        fs::read_to_string(lab.directory.path().join("timeouts")).unwrap(),
+        "7\n7\n7\n4\n"
+    );
+    assert_eq!(
+        fs::read_to_string(lab.directory.path().join("clock")).unwrap(),
+        "1025\n"
+    );
+}
+
+#[test]
+fn ddns_temporary_failure_does_not_skip_other_records() {
+    let lab = Ddns::new(false);
+    lab.curl_failures(1, 6, "");
+    let result = lab.run("", "startup", json!({}));
+    assert!(result.status.success(), "{result:?}");
+    let records = lab.requests.lock().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["payload"]["content"], "2001:db8:2::5");
+    assert_eq!(records[1]["payload"]["content"], "192.0.2.5");
 }
