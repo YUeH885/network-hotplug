@@ -2,7 +2,7 @@
 
 ## 自动化验证
 
-普通测试使用本地 HTTP 服务验证 DDNS 的 PATCH 请求、凭据文件、地址筛选、DAD 完成、启动、续租和错误处理，并覆盖配置解析、接口白名单、关联路由筛选、状态比较、路由上下文与脚本筛选、动作、地址续租、PD 候选、路由属性、nftables 生命周期、脚本顺序、失败、超时、进程组回收、慢脚本、队列合并和首次恢复任务。
+普通测试使用本地 HTTP 服务验证 DDNS 的 PATCH 请求、凭据文件、地址筛选、DAD 完成、启动、晚出现的地址与默认路由、恢复调用、续租和错误处理，并覆盖配置解析、接口白名单、关联路由筛选、状态比较、路由上下文与脚本筛选、动作、地址续租、PD 候选、路由属性、nftables 生命周期、脚本顺序、失败、超时、进程组回收、慢脚本、队列合并和首次恢复任务。
 
 ```sh
 cargo fmt --all -- --check
@@ -29,7 +29,9 @@ for test in \
     notification_loss_rescans_without_fabricating_nft_reload \
     cold_start_without_addresses_then_restoration_and_manual_rescan \
     npt_script_syncs_full_pd_clears_invalid_prefixes_and_restores_on_reload \
-    npt_iface_hooks_follow_candidate_priority_and_ignore_other_routes
+    npt_iface_hooks_follow_candidate_priority_and_ignore_other_routes \
+    cake_hooks_restore_upload_download_and_recreated_interfaces \
+    business_hooks_restore_before_ddns_and_follow_late_pd
 do
     sudo unshare --net "$TEST_BINARY" --ignored --exact "$test" --nocapture
 done
@@ -83,8 +85,14 @@ sudo env NETWORK_HOTPLUG_BINARY="$PWD/target/release/network-hotplug" \
 | NPT 专用路由表 | 选择该表的 DHCP unreachable 前缀，排除 BGP 路由 |
 | NPT 事务失败 | 缺少 DNAT map 时整个事务失败，原有 SNAT elements 保持完整 |
 | NPT 多 WAN 与规则恢复 | 单 WAN 更新保持其他 WAN；接口删除后清空；reload 后恢复且只形成一次 reload 调用 |
+| CAKE 接口生命周期 | 冷启动、晚出现、carrier 恢复和接口重建后配置上行、IFB 下行及 ingress 重定向；创建与启用分步通知时按事件状态筛选，地址和路由变化保持独立 |
+| 业务顺序与冷启动 | CAKE、NPT、conntrack、DDNS 按目录顺序执行；已有连接在启动和相同 PD 续租时保留，晚出现的 PD 先恢复 map 并清理连接，再更新 DDNS |
 
 丢失测试保持默认 socket buffer，暂停测试进程，批量变更地址和 nftables rules，检查内核 socket 的 drop 计数后恢复进程。该流程同时验证已知接口状态比较与 nftables 未知生命周期重新建立基线。
+
+CAKE 测试还需要 `tc`、`modprobe` 与 CAKE、IFB、u32、mirred 内核支持。IFB 和队列配置位于测试 namespace，脚本的锁文件位于测试临时目录。
+
+业务组合测试还需要 `conntrack`，在独立 namespace 中创建 IPv4 和 IPv6 条目，验证变化后的清理与恢复调用时的保留。该测试使用本地 curl 替身记录 DDNS 调用；Cloudflare 请求格式与失败恢复由普通 HTTP 测试验证。
 
 ## 手工观察
 

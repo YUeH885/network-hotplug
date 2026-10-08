@@ -21,10 +21,11 @@ rtnetlink 通知通过 socket BPF 在内核接收队列前过滤，状态比较�
 ```text
 /etc/network-hotplug.d/
 ├── cloudflare-header
-├── npt.sh
 ├── iface/
-│   ├── 10-ddns.sh
-│   └── 20-npt.sh
+│   ├── 10-cake.sh
+│   ├── 20-npt.sh
+│   ├── 30-conntrack.sh
+│   └── 90-ddns.sh
 └── nftables/
     └── 20-npt.sh
 ```
@@ -38,7 +39,8 @@ rtnetlink 通知通过 socket BPF 在内核接收队列前过滤，状态比较�
 ```sh
 #!/bin/sh
 [ "$NH_DEVICE" = ppp-uplink_a ] || exit 0
-[ "$NH_IPV4_CHANGED" = 1 ] || exit 0
+[ "$NH_IPV4_CHANGED" = 1 ] || [ "$NH_IPV6_CHANGED" = 1 ] ||
+    [ "$NH_PD_CHANGED" = 1 ] || exit 0
 exec /usr/sbin/conntrack -F
 ```
 

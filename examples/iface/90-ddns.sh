@@ -8,17 +8,10 @@ if [ -n "${NH_EVENT_FILE:-}" ]; then
     reason=$(/usr/bin/jq -r '.reason' "$NH_EVENT_FILE")
     if [ "$reason" = startup ]; then
         [ -z "${NH_DEVICE:-}" ] || exit 0
-    else
-        /usr/bin/jq -e '.changes.ipv4 or .changes.ipv6 or .changes.ipv4_attributes or .changes.ipv6_attributes or .changes.pd_routes or .changes.interface' "$NH_EVENT_FILE" >/dev/null || exit 0
     fi
 fi
 
 addresses=$(/usr/sbin/ip -j address show)
-
-request() {
-    /usr/bin/curl --silent --show-error --fail --proto '=https' --connect-timeout 3 --max-time 7 \
-        --header "@$header_file" --header 'Content-Type: application/json' "$@"
-}
 
 interface_address() {
     printf '%s\n' "$addresses" | /usr/bin/jq -er --arg device "$1" --arg type "$2" '
@@ -84,13 +77,17 @@ sync_record() {
     if [ -n "${NH_DEVICE:-}" ] && [ "$NH_DEVICE" != "$device" ]; then return 0; fi
     if [ -n "${NH_EVENT_FILE:-}" ] && [ "$reason" != startup ]; then
         if [ "$#" = 7 ]; then
-            filter='.changes.pd_routes or .changes.interface'
+            filter='.changes.pd_routes'
         elif [ "$record_type" = A ]; then
             filter='.changes.ipv4 or .changes.ipv4_attributes'
         else
             filter='.changes.ipv6 or .changes.ipv6_attributes'
         fi
-        /usr/bin/jq -e "$filter" "$NH_EVENT_FILE" >/dev/null || return 0
+        /usr/bin/jq -e "$filter or .changes.interface or .changes.default_route or
+            (.changes.admin_up and .state.interface.admin_up) or
+            (.changes.carrier and .state.interface.carrier) or
+            (.reason | IN(\"manual\", \"netlink_loss\", \"dump_interrupted\"))" \
+            "$NH_EVENT_FILE" >/dev/null || return 0
     fi
     if [ "$#" = 7 ]; then
         address=$(pd_address "$device" "$6" "$7") || return 1
@@ -103,7 +100,9 @@ sync_record() {
     fi
     endpoint="$api/zones/$zone/dns_records/$record"
     payload=$(/usr/bin/jq -n --arg address "$address" '{content:$address}') || return 1
-    response=$(request --request PATCH --data "$payload" "$endpoint") || return 1
+    response=$(/usr/bin/curl --silent --show-error --fail --proto '=https' --connect-timeout 3 --max-time 7 \
+        --header "@$header_file" --header 'Content-Type: application/json' \
+        --request PATCH --data "$payload" "$endpoint") || return 1
     if ! printf '%s\n' "$response" | /usr/bin/jq -e '.success == true' >/dev/null; then
         printf 'ddns: Cloudflare update failed for %s\n' "$name" >&2
         return 1

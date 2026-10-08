@@ -90,7 +90,7 @@ impl Ddns {
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
-        let script = include_str!("../examples/iface/10-ddns.sh")
+        let script = include_str!("../examples/iface/90-ddns.sh")
             .replace(
                 "api=https://api.cloudflare.com/client/v4",
                 &format!("api=http://{address}/client/v4"),
@@ -390,4 +390,59 @@ fn ddns_pd_reselects_after_candidate_priority_changes() {
         lab.requests.lock().unwrap()[2]["payload"]["content"],
         "2001:db8:50:1:0:0:0:5"
     );
+}
+
+#[test]
+fn ddns_recovers_after_default_route_arrival_and_explicit_rescans() {
+    let lab = Ddns::new(true);
+    assert!(!lab.run("", "startup", json!({})).status.success());
+    assert_eq!(lab.requests.lock().unwrap().len(), 2);
+    assert!(
+        lab.run("ppp-uplink_a", "kernel", json!({"default_route":true}))
+            .status
+            .success()
+    );
+    assert_eq!(lab.requests.lock().unwrap().len(), 3);
+    for reason in ["manual", "netlink_loss", "dump_interrupted"] {
+        assert!(lab.run("wan0", reason, json!({})).status.success());
+    }
+    assert_eq!(lab.requests.lock().unwrap().len(), 6);
+    assert!(
+        lab.run("wan0", "kernel", json!({"routes":true}))
+            .status
+            .success()
+    );
+    assert_eq!(lab.requests.lock().unwrap().len(), 6);
+}
+
+#[test]
+fn ddns_cold_start_without_addresses_follows_later_readiness() {
+    let lab = Ddns::new(false);
+    lab.addresses(json!([]));
+    assert!(lab.run("", "startup", json!({})).status.success());
+    assert!(lab.requests.lock().unwrap().is_empty());
+    lab.addresses(default_addresses());
+    assert!(
+        lab.run("ppp-uplink_a", "kernel", json!({"ipv4":true}))
+            .status
+            .success()
+    );
+    assert!(
+        lab.run("wan0", "kernel", json!({"ipv6_attributes":true}))
+            .status
+            .success()
+    );
+    assert_eq!(lab.requests.lock().unwrap().len(), 2);
+    assert!(
+        lab.run_event(
+            "wan0",
+            json!({
+                "reason":"kernel", "changes":{"carrier":true},
+                "state":{"interface":{"carrier":true}}
+            })
+        )
+        .status
+        .success()
+    );
+    assert_eq!(lab.requests.lock().unwrap().len(), 3);
 }

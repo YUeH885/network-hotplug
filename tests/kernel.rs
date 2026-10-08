@@ -787,7 +787,7 @@ fn npt_script_syncs_full_pd_clears_invalid_prefixes_and_restores_on_reload() {
         "100",
     ]);
     let helper = lab.directory.path().join("npt.sh");
-    let source = include_str!("../examples/npt.sh")
+    let source = include_str!("../examples/iface/20-npt.sh")
         .replace("ppp-uplink_a", "wan-a")
         .replace("wan0", "wan-b")
         .replace(
@@ -949,7 +949,7 @@ fn npt_script_syncs_full_pd_clears_invalid_prefixes_and_restores_on_reload() {
     assert!(sync("wan-b").status.success());
 
     let wrapper = include_str!("../examples/nftables/20-npt.sh").replace(
-        "exec /bin/sh /etc/network-hotplug.d/npt.sh",
+        "exec /bin/sh /etc/network-hotplug.d/iface/20-npt.sh",
         &format!("exec /bin/sh '{}'", helper.display()),
     );
     std::fs::write(lab.directory.path().join("nftables/20-npt.sh"), wrapper).unwrap();
@@ -973,28 +973,22 @@ fn npt_iface_hooks_follow_candidate_priority_and_ignore_other_routes() {
             "-6", "route", "add", prefix, "dev", "wan-a", "proto", "16", "metric", metric,
         ]);
     }
-    let helper = lab.directory.path().join("npt.sh");
-    let source = include_str!("../examples/npt.sh")
+    let calls = lab.directory.path().join("sync-count");
+    let source = include_str!("../examples/iface/20-npt.sh")
         .replace("ppp-uplink_a", "wan-a")
         .replace("wan0", "wan-b")
         .replace(
             "lock=/run/lock/network-hotplug-npt.lock",
             &format!("lock={}/npt.lock", lab.directory.path().display()),
-        );
-    std::fs::write(&helper, source).unwrap();
-    let calls = lab.directory.path().join("sync-count");
-    let wrapper = include_str!("../examples/iface/20-npt.sh")
-        .replace("ppp-uplink_a", "wan-a")
-        .replace("wan0", "wan-b")
+        )
         .replace(
-            "exec /bin/sh /etc/network-hotplug.d/npt.sh",
+            "links=$(/usr/sbin/ip -j link show)",
             &format!(
-                "printf 'sync\n' >> '{}'\nexec /bin/sh '{}'",
+                "printf 'sync\n' >> '{}'\nlinks=$(/usr/sbin/ip -j link show)",
                 calls.display(),
-                helper.display()
             ),
         );
-    std::fs::write(lab.directory.path().join("iface/20-npt.sh"), wrapper).unwrap();
+    std::fs::write(lab.directory.path().join("iface/20-npt.sh"), source).unwrap();
     let selected = || map_elements("uplink_a_snat")[0][1]["prefix"]["addr"].clone();
     let count = || read_to_string(&calls).unwrap_or_default().lines().count();
     lab.start_for(&["wan-a"]);
@@ -1055,5 +1049,346 @@ fn npt_iface_hooks_follow_candidate_priority_and_ignore_other_routes() {
     lab.stable();
     assert_eq!(count(), 2);
     assert_eq!(selected(), "2001:db8:80::");
+    lab.alive();
+}
+
+#[test]
+#[ignore = "requires an empty isolated network namespace and CAKE support"]
+fn cake_hooks_restore_upload_download_and_recreated_interfaces() {
+    let mut lab = Lab::new();
+    let records = lab.directory.path().join("cake.log");
+    let hook = include_str!("../examples/iface/10-cake.sh")
+        .replace("ppp-uplink_a", "wan-a")
+        .replace("wan0", "wan-b")
+        .replace("ifb-uplink_a", "ifb-a")
+        .replace("ifb-wan-b", "ifb-b")
+        .replace(
+            "/run/lock/network-hotplug-cake.lock",
+            &lab.directory.path().join("cake.lock").display().to_string(),
+        )
+        .replace(
+            "    printf 'network-hotplug-cake: configured",
+            &format!("    printf '%s\\n' \"$device\" >> '{}'\n    printf 'network-hotplug-cake: configured", records.display()),
+        );
+    std::fs::write(lab.directory.path().join("iface/10-cake.sh"), hook).unwrap();
+    let count = |device: &str| {
+        read_to_string(&records)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == device)
+            .count()
+    };
+    let verify = |device: &str, ifb: &str, upload: u64, download: u64| {
+        for (target, bandwidth, diffserv, flowmode, ingress) in [
+            (device, upload, "diffserv3", "dual-srchost", false),
+            (ifb, download, "besteffort", "dual-dsthost", true),
+        ] {
+            let qdiscs: Value = serde_json::from_slice(
+                &command("/usr/sbin/tc", &["-j", "qdisc", "show", "dev", target]).stdout,
+            )
+            .unwrap();
+            let cake = qdiscs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|qdisc| qdisc["kind"] == "cake" && qdisc["root"] == true)
+                .unwrap();
+            assert_eq!(cake["options"]["bandwidth"], bandwidth / 8);
+            assert_eq!(cake["options"]["diffserv"], diffserv);
+            assert_eq!(cake["options"]["flowmode"], flowmode);
+            assert_eq!(cake["options"]["nat"], true);
+            assert_eq!(cake["options"]["ingress"], ingress);
+        }
+        let filters: Value = serde_json::from_slice(
+            &command(
+                "/usr/sbin/tc",
+                &["-j", "filter", "show", "dev", device, "parent", "ffff:"],
+            )
+            .stdout,
+        )
+        .unwrap();
+        assert!(filters.as_array().unwrap().iter().any(|filter| {
+            filter["protocol"] == "all"
+                && filter["options"]["actions"]
+                    .as_array()
+                    .is_some_and(|actions| {
+                        actions.iter().any(|action| {
+                            action["kind"] == "mirred"
+                                && action["mirred_action"] == "redirect"
+                                && action["to_dev"] == ifb
+                        })
+                    })
+        }));
+    };
+
+    ip(&[
+        "link", "add", "wan-a", "type", "veth", "peer", "name", "peer-a",
+    ]);
+    ip(&["link", "set", "peer-a", "up"]);
+    ip(&["link", "set", "wan-a", "up"]);
+    lab.start_for(&["wan-a", "wan-b"]);
+    lab.wait(|| count("wan-a") == 1);
+    verify("wan-a", "ifb-a", 60_000_000, 450_000_000);
+    assert_eq!(count("wan-b"), 0);
+
+    ip(&["link", "add", "wan-b", "type", "dummy"]);
+    ip(&["link", "set", "wan-b", "up"]);
+    lab.wait(|| count("wan-b") == 1);
+    verify("wan-b", "ifb-b", 50_000_000, 270_000_000);
+
+    let event_file = lab.directory.path().join("inactive-event.json");
+    for present in [true, false] {
+        std::fs::write(
+            &event_file,
+            serde_json::to_vec(&json!({
+                "reason":"kernel", "action":"ifupdate", "changes":{"link":true},
+                "state":{"interface":{"present":present,"admin_up":false}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = Command::new("/bin/sh")
+            .arg(lab.directory.path().join("iface/10-cake.sh"))
+            .env("NH_DEVICE", "wan-b")
+            .env("NH_EVENT_FILE", &event_file)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(count("wan-b"), 1, "{}", lab.logs());
+    }
+
+    ip(&["addr", "add", "192.0.2.2/24", "dev", "wan-a"]);
+    ip(&[
+        "-6",
+        "route",
+        "add",
+        "2001:db8:40::/64",
+        "dev",
+        "wan-a",
+        "proto",
+        "16",
+    ]);
+    lab.wait(|| {
+        lab.events("wan-a")
+            .iter()
+            .any(|event| event["changes"]["ipv4"] == true)
+            && lab
+                .events("wan-a")
+                .iter()
+                .any(|event| event["changes"]["pd"] == true)
+    });
+    lab.stable();
+    assert_eq!(count("wan-a"), 1, "{}", lab.logs());
+    assert_eq!(count("wan-b"), 1, "{}", lab.logs());
+
+    ip(&["link", "set", "peer-a", "down"]);
+    lab.wait(|| count("wan-a") == 2);
+    ip(&["link", "set", "peer-a", "up"]);
+    lab.wait(|| count("wan-a") == 3);
+    ip(&["link", "del", "wan-a"]);
+    lab.wait(|| {
+        lab.events("wan-a")
+            .iter()
+            .any(|event| event["action"] == "ifdown")
+    });
+    ip(&["link", "add", "wan-a", "type", "dummy"]);
+    ip(&["link", "set", "wan-a", "up"]);
+    lab.wait(|| count("wan-a") == 4);
+    verify("wan-a", "ifb-a", 60_000_000, 450_000_000);
+    assert_eq!(count("wan-b"), 1);
+
+    lab.signal(libc::SIGHUP);
+    lab.wait(|| count("wan-a") == 5 && count("wan-b") == 2);
+    lab.stable();
+    assert_eq!(count("wan-a"), 5);
+    assert_eq!(count("wan-b"), 2);
+    lab.alive();
+}
+
+#[test]
+#[ignore = "requires an empty isolated network namespace, CAKE and conntrack support"]
+fn business_hooks_restore_before_ddns_and_follow_late_pd() {
+    let mut lab = Lab::new();
+    for device in ["wan-a", "wan-b"] {
+        ip(&["link", "add", device, "type", "dummy"]);
+        ip(&["link", "set", device, "addrgenmode", "none"]);
+        ip(&["link", "set", device, "up"]);
+    }
+    ip(&["addr", "add", "192.0.2.2/24", "dev", "wan-a"]);
+    ip(&[
+        "-6",
+        "route",
+        "add",
+        "2001:db8:40::/64",
+        "dev",
+        "wan-a",
+        "proto",
+        "16",
+    ]);
+    nft(NPT_MAPS);
+    let adapt = |source: &str| {
+        source
+            .replace("ppp-uplink_a", "wan-a")
+            .replace("wan0", "wan-b")
+    };
+    let cake = adapt(include_str!("../examples/iface/10-cake.sh"))
+        .replace("ifb-uplink_a", "ifb-wan-a")
+        .replace(
+            "/run/lock/network-hotplug-cake.lock",
+            &lab.directory.path().join("cake.lock").display().to_string(),
+        );
+    let npt = adapt(include_str!("../examples/iface/20-npt.sh")).replace(
+        "lock=/run/lock/network-hotplug-npt.lock",
+        &format!("lock={}/npt.lock", lab.directory.path().display()),
+    );
+    let conntrack = adapt(include_str!("../examples/iface/30-conntrack.sh"));
+    let requests = lab.directory.path().join("requests.jsonl");
+    let curl = lab.directory.path().join("curl.sh");
+    std::fs::write(&curl, format!(
+        "/usr/bin/jq -nc --arg count \"$(/usr/sbin/conntrack -C)\" '{{count:($count | tonumber)}}' >> '{}'\nprintf '%s\\n' '{{\"success\":true}}'\n", requests.display()
+    )).unwrap();
+    let ddns = adapt(include_str!("../examples/iface/90-ddns.sh"))
+        .replace("/usr/bin/curl", &format!("/bin/sh '{}'", curl.display()))
+        .replace(
+            "sync_record AAAA wan-b uplink-b.example.com ZONE_ID RECORD_AAAA_ID",
+            "sync_record AAAA wan-b uplink-b.example.com ZONE_ID RECORD_AAAA_ID 254 2001:db8:100:1::5",
+        );
+    for (name, source) in [
+        ("10-cake.sh", cake),
+        ("20-npt.sh", npt),
+        ("30-conntrack.sh", conntrack),
+        ("90-ddns.sh", ddns),
+    ] {
+        std::fs::write(lab.directory.path().join("iface").join(name), source).unwrap();
+    }
+    let seed = || {
+        for (source, destination) in [
+            ("192.0.2.2", "198.51.100.2"),
+            ("2001:db8:1::2", "2001:db8:2::2"),
+        ] {
+            command(
+                "/usr/sbin/conntrack",
+                &[
+                    "-I",
+                    "-p",
+                    "udp",
+                    "--orig-src",
+                    source,
+                    "--orig-dst",
+                    destination,
+                    "--sport",
+                    "10000",
+                    "--dport",
+                    "20000",
+                    "--timeout",
+                    "300",
+                ],
+            );
+        }
+    };
+    let count = || {
+        String::from_utf8(command("/usr/sbin/conntrack", &["-C"]).stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let records = || {
+        read_to_string(&requests)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    seed();
+    lab.start_for(&["wan-a", "wan-b"]);
+    lab.wait(|| records().len() == 1);
+    lab.stable();
+    assert_eq!(count(), 2);
+    assert_eq!(records()[0]["count"], 2);
+    assert_ne!(map_elements("uplink_a_snat"), json!([]));
+    assert_eq!(map_elements("uplink_b_snat"), json!([]));
+    for device in ["wan-a", "wan-b", "ifb-wan-a", "ifb-wan-b"] {
+        assert!(
+            String::from_utf8(command("/usr/sbin/tc", &["qdisc", "show", "dev", device]).stdout)
+                .unwrap()
+                .contains("cake")
+        );
+    }
+    let startup_order = lab
+        .logs()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["event"] == "script_finished" && record["id"] == 1)
+        .map(|record| {
+            std::path::Path::new(record["script"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        startup_order,
+        [
+            "10-cake.sh",
+            "10-record.sh",
+            "20-npt.sh",
+            "30-conntrack.sh",
+            "90-ddns.sh"
+        ]
+    );
+
+    ip(&[
+        "-6",
+        "route",
+        "add",
+        "2001:db8:99::/64",
+        "dev",
+        "wan-b",
+        "proto",
+        "186",
+    ]);
+    ip(&[
+        "-6",
+        "route",
+        "replace",
+        "2001:db8:40::/64",
+        "dev",
+        "wan-a",
+        "proto",
+        "16",
+    ]);
+    lab.stable();
+    assert_eq!(count(), 2);
+    assert_eq!(records().len(), 1);
+
+    ip(&[
+        "-6",
+        "route",
+        "add",
+        "2001:db8:60::/64",
+        "dev",
+        "wan-b",
+        "proto",
+        "16",
+    ]);
+    lab.wait(|| records().len() == 2);
+    assert_ne!(map_elements("uplink_b_snat"), json!([]));
+    assert_eq!(count(), 0);
+    assert_eq!(records()[1]["count"], 0);
+    seed();
+    lab.signal(libc::SIGHUP);
+    lab.wait(|| records().len() == 4);
+    assert_eq!(count(), 2);
+    for record in &records()[2..] {
+        assert_eq!(record["count"], 2);
+    }
+    assert!(!lab.logs().contains("\"level\":\"error\""));
     lab.alive();
 }
