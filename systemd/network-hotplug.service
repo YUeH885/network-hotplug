@@ -1,0 +1,22 @@
+[Unit]
+Description=Dispatch Linux network state changes to directory hooks
+After=systemd-networkd.service nftables.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/network-hotplug
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=network-hotplug
+RuntimeDirectoryMode=0700
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
