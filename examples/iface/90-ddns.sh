@@ -4,13 +4,6 @@ set -eu
 api=https://api.cloudflare.com/client/v4
 header_file=/etc/network-hotplug.d/cloudflare-header
 
-if [ -n "${NH_EVENT_FILE:-}" ]; then
-    reason=$(/usr/bin/jq -r '.reason' "$NH_EVENT_FILE")
-    if [ "$reason" = startup ]; then
-        [ -z "${NH_DEVICE:-}" ] || exit 0
-    fi
-fi
-
 uptime_seconds() {
     read -r uptime _ < /proc/uptime
     printf '%s\n' "${uptime%%.*}"
@@ -77,8 +70,11 @@ sync_record() {
     name=$3
     zone=$4
     record=$5
+    case " $completed " in
+        *" $record "*) return 0 ;;
+    esac
     if [ -n "${NH_DEVICE:-}" ] && [ "$NH_DEVICE" != "$device" ]; then return 0; fi
-    if [ -n "${NH_EVENT_FILE:-}" ] && [ "$reason" != startup ]; then
+    if [ -n "${NH_EVENT_FILE:-}" ]; then
         if [ "$#" = 7 ]; then
             filter='.changes.pd_routes'
         elif [ "$record_type" = A ]; then
@@ -89,8 +85,11 @@ sync_record() {
         /usr/bin/jq -e "$filter or .changes.interface or .changes.default_route or
             (.changes.admin_up and .state.interface.admin_up) or
             (.changes.carrier and .state.interface.carrier) or
-            (.reason | IN(\"manual\", \"netlink_loss\", \"dump_interrupted\"))" \
+            (.reason | IN(\"startup\", \"manual\", \"netlink_loss\", \"dump_interrupted\"))" \
             "$NH_EVENT_FILE" >/dev/null || return 0
+    fi
+    if [ -z "$addresses" ]; then
+        addresses=$(/usr/sbin/ip -j address show ${NH_DEVICE:+dev "$NH_DEVICE"} 2>/dev/null || printf '[]\n')
     fi
     if [ "$#" = 7 ]; then
         address=$(pd_address "$device" "$6" "$7") || return 1
@@ -99,6 +98,7 @@ sync_record() {
     fi
     if [ -z "$address" ]; then
         printf 'ddns: no eligible address for %s on %s\n' "$name" "$device"
+        completed="$completed $record"
         return 0
     fi
     remaining=$((deadline - $(uptime_seconds)))
@@ -124,6 +124,7 @@ sync_record() {
         printf 'ddns: Cloudflare update failed for %s\n' "$name" >&2
         return 1
     fi
+    completed="$completed $record"
     printf 'ddns: updated %s %s\n' "$record_type" "$name"
 }
 
@@ -134,8 +135,9 @@ run_records() {
 
 deadline=$(($(uptime_seconds) + 25))
 attempt=1
+completed=
 while :; do
-    addresses=$(/usr/sbin/ip -j address show)
+    addresses=
     status=0
     retry_needed=0
     run_records

@@ -3,7 +3,7 @@ use network_hotplug::model::*;
 use network_hotplug::netlink::codec;
 use network_hotplug::nftables::{Detector, Table, TableNotice};
 use network_hotplug::options::Options;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 fn address(ip: &str) -> Address {
     Address {
@@ -19,13 +19,7 @@ fn address(ip: &str) -> Address {
         protocol: None,
         usable: true,
         preferred: true,
-        attributes: BTreeMap::new(),
-        lifetime: Some(AddressLifetime {
-            preferred_seconds: 1800,
-            valid_seconds: 3600,
-            created_centiseconds: 10,
-            updated_centiseconds: 10,
-        }),
+        temporary: false,
     }
 }
 
@@ -52,17 +46,14 @@ fn snapshot() -> Snapshot {
 fn route(prefix: &str) -> Route {
     let (ip, length) = prefix.split_once('/').unwrap();
     Route {
-        properties: RouteProperties {
-            family: 6,
-            destination: ip.into(),
-            prefix_len: length.parse().unwrap(),
-            output_ifindex: Some(10),
-            table: 254,
-            protocol: 16,
-            route_type: 1,
-            ..Default::default()
-        },
-        expires: Some(100),
+        family: 6,
+        destination: ip.into(),
+        prefix_len: length.parse().unwrap(),
+        output_ifindex: Some(10),
+        table: 254,
+        protocol: 16,
+        route_type: 1,
+        ..Default::default()
     }
 }
 
@@ -75,17 +66,13 @@ fn event(old: Option<View>, new: View, reason: &str) -> Option<Event> {
 }
 
 #[test]
-fn startup_restores_current_state_without_address_changes_or_old_state() {
+fn startup_restores_current_state_without_address_changes() {
     let e = event(None, view(&snapshot()), "startup").unwrap();
     assert_eq!(e.action, "ifup");
     assert_eq!(e.changes, Changes::default());
     assert!(e.state.interface.admin_up);
     assert_eq!(e.state.ipv4[0].address, "192.0.2.2");
-    let json = serde_json::to_value(&e).unwrap();
-    assert!(json.get("old").is_none());
-    assert!(json.get("new").is_none());
-    assert_eq!(e.environment().len(), 10);
-    assert!(!e.environment().contains_key("NH_OLD_KNOWN"));
+    assert_eq!(e.environment().len(), 9);
 }
 
 #[test]
@@ -104,23 +91,10 @@ fn runtime_address_addition_and_deletion_are_real_changes() {
 }
 
 #[test]
-fn countdown_duplicate_notifications_and_renewal_do_not_change_address_sets() {
+fn duplicate_notifications_and_coalesced_round_trips_do_not_dispatch() {
     let old = snapshot();
     assert!(event(Some(view(&old)), view(&old), "kernel").is_none());
-    let mut new = old.clone();
-    let l = new.addresses[0].lifetime.as_mut().unwrap();
-    l.valid_seconds -= 5;
-    l.preferred_seconds -= 5;
-    assert!(event(Some(view(&old)), view(&new), "kernel").is_none());
-    new.addresses[0]
-        .lifetime
-        .as_mut()
-        .unwrap()
-        .updated_centiseconds += 100;
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
-    assert!(e.changes.ipv4_lifetime);
-    assert!(!e.changes.ipv4);
-    assert!(!e.changes.ipv4_attributes);
+    assert!(event(Some(view(&old)), view(&old), "coalesced").is_none());
 }
 
 #[test]
@@ -154,14 +128,9 @@ fn deprecation_changes_address_attributes_without_changing_membership_or_usable_
     let mut new = old.clone();
     new.addresses[0].flags = 0x20;
     new.addresses[0].preferred = false;
-    new.addresses[0]
-        .lifetime
-        .as_mut()
-        .unwrap()
-        .preferred_seconds = 0;
     let changes = Changes::between(&view(&old), &view(&new));
     assert!(changes.ipv6_attributes);
-    assert!(!changes.ipv6 && !changes.ipv6_usable && !changes.ipv6_lifetime);
+    assert!(!changes.ipv6 && !changes.ipv6_usable);
 }
 
 #[test]
@@ -175,8 +144,6 @@ fn pd_candidates_are_prefix_sets_and_exclude_default_routes() {
     assert!(!e.changes.ipv6);
     assert_eq!(e.state.pd_prefixes, ["2001:db8:40::/56"]);
     let old = new.clone();
-    new.routes[0].expires = Some(3600);
-    assert!(event(Some(view(&old)), view(&new), "kernel").is_none());
     new.routes.push(route("::/0"));
     new.normalize();
     let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
@@ -195,7 +162,7 @@ fn metric_and_route_attributes_do_not_change_the_prefix_set() {
     old.normalize();
     let mut new = old.clone();
     for r in &mut new.routes {
-        r.properties.metric = 500;
+        r.metric = 500;
     }
     let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
     assert!(e.changes.routes);
@@ -208,9 +175,8 @@ fn metric_and_route_attributes_do_not_change_the_prefix_set() {
     let old = new.clone();
     new.routes
         .iter_mut()
-        .find(|r| r.properties.prefix_len == 0)
+        .find(|r| r.prefix_len == 0)
         .unwrap()
-        .properties
         .metric = 1000;
     let changes = event(Some(view(&old)), view(&new), "kernel")
         .unwrap()
@@ -225,8 +191,8 @@ fn route_context_supports_script_filters_without_hiding_other_protocols() {
     for protocol in [4, 9, 186] {
         let mut new = old.clone();
         let mut r = route("2001:db8::/64");
-        r.properties.protocol = protocol;
-        r.properties.table = 100;
+        r.protocol = protocol;
+        r.table = 100;
         new.routes.push(r);
         let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
         assert!(e.changes.routes);
@@ -238,32 +204,32 @@ fn route_context_supports_script_filters_without_hiding_other_protocols() {
     }
     let mut new = old.clone();
     let mut r = route("2001:db8::/64");
-    r.properties.output_ifindex = Some(11);
+    r.output_ifindex = Some(11);
     new.routes.push(r);
     assert!(event(Some(view(&old)), view(&new), "kernel").is_none());
 }
 
 #[test]
-fn unassociated_routes_do_not_change_device_or_startup_views() {
+fn unreachable_dhcp_pd_routes_are_projected_into_active_devices() {
     let old = snapshot();
+    let mut main_unassociated = old.clone();
+    let mut r_main = route("2001:db8:54::/62");
+    r_main.output_ifindex = None;
+    r_main.route_type = 7;
+    r_main.table = 254;
+    main_unassociated.routes.push(r_main);
+    assert!(event(Some(view(&old)), view(&main_unassociated), "kernel").is_none());
+
     let mut new = old.clone();
     let mut r = route("2001:db8:54::/62");
-    r.properties.output_ifindex = None;
-    r.properties.route_type = 7;
-    r.properties.table = 10010;
+    r.output_ifindex = None;
+    r.route_type = 7;
+    r.table = 10010;
     new.routes.push(r);
-    assert!(view(&new).pd_prefixes.is_empty());
-    assert!(
-        Event::build(
-            1,
-            "",
-            Some(View::project(&old, "")),
-            View::project(&new, ""),
-            "kernel",
-            1,
-        )
-        .is_none()
-    );
+    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    assert!(e.changes.pd);
+    assert!(e.changes.pd_routes);
+    assert_eq!(e.state.pd_prefixes, ["2001:db8:54::/62"]);
 }
 
 #[test]
@@ -284,7 +250,6 @@ fn defaults_select_configuration_and_use_actual_interface_names() {
         std::path::Path::new("/tmp/hotplug.json")
     );
     let e = event(None, view(&snapshot()), "startup").unwrap();
-    assert_eq!(e.environment()["NH_INTERFACE"], "ppp-uplink_a");
     assert_eq!(e.environment()["NH_DEVICE"], "ppp-uplink_a");
 }
 
@@ -446,11 +411,11 @@ fn route_decoder_uses_rtm_protocol_and_extended_table_and_normalizes_prefix() {
     );
     attribute(&mut b, 6, &500_u32.to_ne_bytes());
     let r = codec::route(&b).unwrap().unwrap();
-    assert_eq!(r.properties.protocol, 16);
-    assert_eq!(r.properties.table, 10086);
-    assert_eq!(r.properties.destination, "2001:db8:1:54::");
-    assert_eq!(r.properties.metric, 500);
-    assert_eq!(r.properties.output_ifindex, None);
+    assert_eq!(r.protocol, 16);
+    assert_eq!(r.table, 10086);
+    assert_eq!(r.destination, "2001:db8:1:54::");
+    assert_eq!(r.metric, 500);
+    assert_eq!(r.output_ifindex, None);
 }
 
 #[test]
@@ -491,7 +456,7 @@ fn address_and_route_order_does_not_change_state() {
     assert!(event(Some(view(&old)), view(&new), "kernel").is_none());
 
     new.addresses[0].prefix_len = 28;
-    new.routes[0].properties.metric = 100;
+    new.routes[0].metric = 100;
     let changes = Changes::between(&view(&old), &view(&new));
     assert!(changes.ipv4_attributes && changes.route_attributes);
     assert!(!changes.ipv4 && !changes.route_set && !changes.pd);

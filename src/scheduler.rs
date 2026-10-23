@@ -62,9 +62,6 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(options: Arc<Options>, config: Config) -> Result<Self> {
         let mut state = Queue::default();
-        if !config.interfaces.is_empty() {
-            state.slots.insert(String::new(), Slot::default());
-        }
         for device in config.interfaces {
             state.slots.insert(device, Slot::default());
         }
@@ -87,13 +84,10 @@ impl Scheduler {
         let mut queue = self.queue.0.lock().unwrap();
         let mut ready = Vec::new();
         for (device, slot) in &mut queue.slots {
-            if self.initialized && device.is_empty() {
-                continue;
-            }
             let new = View::project(snapshot, device);
             if !self.initialized {
                 slot.observed = new.clone();
-                if !device.is_empty() && new.link.is_none() {
+                if new.link.is_none() {
                     continue;
                 }
                 slot.delivered = None;
@@ -182,7 +176,7 @@ fn worker(options: &Options, shared: &(Mutex<Queue>, Condvar), stop: &AtomicBool
             }
             queue.ready.pop_front().unwrap()
         };
-        match &lane {
+        let dispatched = match &lane {
             Lane::Network(device) => {
                 let (work, previous) = {
                     let mut queue = shared.0.lock().unwrap();
@@ -200,6 +194,9 @@ fn worker(options: &Options, shared: &(Mutex<Queue>, Condvar), stop: &AtomicBool
                     work.count,
                 ) {
                     run_hook(options, &options.iface_directory(), &event, stop);
+                    true
+                } else {
+                    false
                 }
             }
             Lane::Nftables => {
@@ -216,9 +213,12 @@ fn worker(options: &Options, shared: &(Mutex<Queue>, Condvar), stop: &AtomicBool
                 };
                 let event = ReloadEvent::new(next_id, &reload);
                 run_hook(options, &options.nftables_directory(), &event, stop);
+                true
             }
+        };
+        if dispatched {
+            next_id += 1;
         }
-        next_id += 1;
         let mut queue = shared.0.lock().unwrap();
         let pending = match &lane {
             Lane::Network(device) => {

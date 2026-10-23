@@ -2,17 +2,16 @@
 set -eu
 
 if [ -n "${NH_EVENT_FILE:-}" ]; then
-    /usr/bin/jq -e --arg device "${NH_DEVICE:-}" '
-        if .reason == "startup" then $device == ""
-        else .state.interface.present and .state.interface.admin_up and
-            (.action == "ifup" or .changes.link or
-                (.reason | IN("manual", "netlink_loss", "dump_interrupted"))) end
+    /usr/bin/jq -e '
+        .state.interface.present and .state.interface.admin_up and
+        (.action == "ifup" or .changes.link or
+            (.reason | IN("startup", "manual", "netlink_loss", "dump_interrupted")))
     ' "$NH_EVENT_FILE" >/dev/null || exit 0
 fi
 
 exec 9>/run/lock/network-hotplug-cake.lock
 /usr/bin/flock -w 5 9
-links=$(/usr/sbin/ip -j link show)
+links=$(/usr/sbin/ip -j link show ${NH_DEVICE:+dev "$NH_DEVICE"} 2>/dev/null || printf '[]\n')
 
 sync_cake() {
     device=$1

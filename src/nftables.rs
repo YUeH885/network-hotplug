@@ -1,4 +1,4 @@
-use crate::event::ScriptEvent;
+use crate::event::{Changes, ScriptEvent};
 use crate::logging::log;
 use crate::netlink::{
     codec,
@@ -9,14 +9,10 @@ use crate::{Result, error};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 const SUBSYSTEM: u16 = 10 << 8;
 const GROUP: u32 = 1 << 6;
-const MAX_TABLE_NOTICES: usize = 65536;
+const RECEIVE_BUFFER_BYTES: i32 = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Table {
@@ -56,15 +52,11 @@ impl Detector {
     }
 
     pub fn notice(&mut self, notice: TableNotice) -> Result<()> {
-        if self.transaction.len() >= MAX_TABLE_NOTICES {
-            return Err(error("nftables table notification queue overflow"));
-        }
         self.transaction.push(notice);
         Ok(())
     }
 
     pub fn commit(&mut self, generation: u32) -> Result<Option<Reloads>> {
-        // Queries establish a committed generation. Older queued transactions are already in that baseline.
         if (generation.wrapping_sub(self.generation) as i32) <= 0 {
             self.transaction.clear();
             return Ok(None);
@@ -131,7 +123,19 @@ impl ScriptEvent for ReloadEvent {
     fn id(&self) -> u64 {
         self.id
     }
-    fn interface(&self) -> Option<&str> {
+    fn device(&self) -> Option<&str> {
+        None
+    }
+    fn source(&self) -> &str {
+        &self.source
+    }
+    fn action(&self) -> &str {
+        &self.action
+    }
+    fn reason(&self) -> Option<&str> {
+        None
+    }
+    fn changes(&self) -> Option<&Changes> {
         None
     }
     fn environment(&self) -> BTreeMap<String, String> {
@@ -160,40 +164,37 @@ impl Reader {
             .transpose()
     }
 
-    fn baseline(&mut self, stop: &AtomicBool) -> Result<Detector> {
-        while !stop.load(Ordering::Relaxed) {
-            let Some(before) = self.generation()? else {
-                continue;
-            };
-            let Some(replies) = self
-                .query
-                .request(SUBSYSTEM | 1, SUBSYSTEM, &[0; 4], true)?
-            else {
-                continue;
-            };
-            let Some(after) = self.generation()? else {
-                continue;
-            };
-            if before == after {
-                let tables = replies
-                    .iter()
-                    .map(|bytes| table(bytes))
-                    .collect::<Result<BTreeSet<_>>>()?;
-                log(
-                    "info",
-                    "nftables_baseline",
-                    json!({"generation":after,"tables":tables.len()}),
-                );
-                return Ok(Detector::new(after, tables));
-            }
+    fn baseline(&mut self) -> Result<Option<Detector>> {
+        let Some(before) = self.generation()? else {
+            return Ok(None);
+        };
+        let Some(replies) = self
+            .query
+            .request(SUBSYSTEM | 1, SUBSYSTEM, &[0; 4], true)?
+        else {
+            return Ok(None);
+        };
+        let Some(after) = self.generation()? else {
+            return Ok(None);
+        };
+        if before == after {
+            let tables = replies
+                .iter()
+                .map(|bytes| table(bytes))
+                .collect::<Result<BTreeSet<_>>>()?;
             log(
-                "warn",
-                "nftables_scan_interrupted",
-                json!({"before":before,"after":after}),
+                "info",
+                "nftables_baseline",
+                json!({"generation":after,"tables":tables.len()}),
             );
-            std::thread::sleep(Duration::from_millis(100));
+            return Ok(Some(Detector::new(after, tables)));
         }
-        Err(error("nftables baseline scan cancelled"))
+        log(
+            "warn",
+            "nftables_scan_interrupted",
+            json!({"before":before,"after":after}),
+        );
+        Ok(None)
     }
 }
 
@@ -230,56 +231,111 @@ fn generation(bytes: &[u8]) -> Result<u32> {
     })?))
 }
 
-#[derive(Default)]
-struct Pending {
-    reloads: Option<Reloads>,
-    error: Option<String>,
-}
-
 pub struct Monitor {
-    mailbox: Arc<Mutex<Pending>>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    socket: Socket,
+    reader: Reader,
+    detector: Option<Detector>,
 }
 
 impl Monitor {
     pub fn open(buffer_size: i32) -> Result<Self> {
+        let buffer_size = buffer_size.min(RECEIVE_BUFFER_BYTES);
         let socket = Socket::open_protocol(libc::NETLINK_NETFILTER, GROUP, buffer_size)?;
-        let mailbox = Arc::new(Mutex::new(Pending::default()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let output = mailbox.clone();
-        let cancel = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("nftables-receiver".into())
-            .spawn(move || {
-                if let Err(e) = receive(socket, buffer_size, &output, &cancel)
-                    && !cancel.load(Ordering::Relaxed)
-                {
-                    output.lock().unwrap().error = Some(e.to_string());
-                }
-            })?;
+        let mut filter = nftables_filter();
+        socket.attach_filter(&mut filter)?;
+        let mut reader = Reader::open(buffer_size)?;
+        let detector = reader.baseline()?;
         Ok(Self {
-            mailbox,
-            stop,
-            thread: Some(thread),
+            socket,
+            reader,
+            detector,
         })
     }
 
-    pub fn take(&self) -> Result<Option<Reloads>> {
-        let mut pending = self.mailbox.lock().unwrap();
-        if let Some(e) = pending.error.take() {
-            return Err(error(e));
-        }
-        Ok(pending.reloads.take())
+    pub fn raw_fd(&self) -> i32 {
+        self.socket.raw_fd()
     }
-}
 
-impl Drop for Monitor {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+    pub fn needs_baseline(&self) -> bool {
+        self.detector.is_none()
+    }
+
+    pub fn drain(&mut self) -> Result<Option<Reloads>> {
+        if self.detector.is_none() {
+            self.detector = self.reader.baseline()?;
+            if self.detector.is_none() {
+                return Ok(None);
+            }
         }
+        let mut reloads = None;
+        for _ in 0..256 {
+            let bytes = match self.socket.receive()? {
+                Datagram::Empty => break,
+                Datagram::Lost => {
+                    log(
+                        "warn",
+                        "nftables_notifications_lost",
+                        json!({"reason":"socket_overflow_or_truncation"}),
+                    );
+                    self.detector = self.reader.baseline()?;
+                    break;
+                }
+                Datagram::Data(bytes) => bytes,
+            };
+            let mut recover = None;
+            let detector = self.detector.as_mut().unwrap();
+            for message in codec::messages(bytes)? {
+                if message.kind == 4 {
+                    recover = Some("netlink_overrun".to_string());
+                    break;
+                }
+                if message.kind == 2 {
+                    let code = codec::u32_at(message.payload, 0)? as i32;
+                    if code == -libc::ENOBUFS {
+                        recover = Some("netlink_overflow".to_string());
+                        break;
+                    }
+                    if code != 0 {
+                        return Err(std::io::Error::from_raw_os_error(-code).into());
+                    }
+                }
+                if message.kind >> 8 != SUBSYSTEM >> 8 {
+                    continue;
+                }
+                let result = match message.kind & 0xff {
+                    0 => detector.notice(TableNotice::New(table(message.payload)?)),
+                    2 | 26 => detector.notice(TableNotice::Delete(table(message.payload)?)),
+                    15 => match detector.commit(generation(message.payload)?) {
+                        Ok(Some(reload)) => {
+                            log(
+                                "info",
+                                "nftables_reload_confirmed",
+                                json!({"generation":reload.generation}),
+                            );
+                            merge_reloads(&mut reloads, reload);
+                            Ok(())
+                        }
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                    _ => Ok(()),
+                };
+                if let Err(e) = result {
+                    recover = Some(e.to_string());
+                    break;
+                }
+            }
+            if let Some(reason) = recover {
+                log(
+                    "warn",
+                    "nftables_notifications_lost",
+                    json!({"reason":reason}),
+                );
+                self.detector = self.reader.baseline()?;
+                break;
+            }
+        }
+        Ok(reloads)
     }
 }
 
@@ -293,81 +349,61 @@ pub fn merge_reloads(pending: &mut Option<Reloads>, new: Reloads) {
     }
 }
 
-fn receive(
-    mut socket: Socket,
-    buffer_size: i32,
-    output: &Mutex<Pending>,
-    stop: &AtomicBool,
-) -> Result<()> {
-    let mut reader = Reader::open(buffer_size)?;
-    let mut detector = reader.baseline(stop)?;
-    while !stop.load(Ordering::Relaxed) {
-        if !socket.wait(100)? {
-            continue;
+fn nftables_filter() -> Vec<libc::sock_filter> {
+    let mut insns = Vec::new();
+    let emit = |insns: &mut Vec<libc::sock_filter>, code: u16, jt: u8, jf: u8, k: u32| {
+        insns.push(libc::sock_filter { code, jt, jf, k });
+    };
+    let mut accepts = Vec::new();
+
+    // Multi-message datagrams: accept so user-space inspects all messages in the datagram.
+    emit(&mut insns, 0x80, 0, 0, 0); // LD | LEN
+    emit(&mut insns, 0x35, 1, 0, 16); // JGE 16
+    accepts.push(insns.len());
+    emit(&mut insns, 0x05, 0, 0, 0);
+    emit(&mut insns, 0x02, 0, 0, 0); // ST M[0]
+    if cfg!(target_endian = "little") {
+        emit(&mut insns, 0x30, 0, 0, 3); // LD | B | ABS
+        for offset in (0..3).rev() {
+            emit(&mut insns, 0x64, 0, 0, 8); // ALU | LSH
+            emit(&mut insns, 0x02, 0, 0, 1); // ST M[1]
+            emit(&mut insns, 0x30, 0, 0, offset);
+            emit(&mut insns, 0x61, 0, 0, 1); // LDX | MEM M[1]
+            emit(&mut insns, 0x4c, 0, 0, 0); // ALU | OR | X
         }
-        let bytes = match socket.receive()? {
-            Datagram::Empty => continue,
-            Datagram::Lost => {
-                log(
-                    "warn",
-                    "nftables_notifications_lost",
-                    json!({"reason":"socket_overflow_or_truncation"}),
-                );
-                detector = reader.baseline(stop)?;
-                continue;
-            }
-            Datagram::Data(bytes) => bytes,
-        };
-        let mut recover = None;
-        for message in codec::messages(bytes)? {
-            if message.kind == 4 {
-                recover = Some("netlink_overrun".to_string());
-                break;
-            }
-            if message.kind == 2 {
-                let code = codec::u32_at(message.payload, 0)? as i32;
-                if code == -libc::ENOBUFS {
-                    recover = Some("netlink_overflow".to_string());
-                    break;
-                }
-                if code != 0 {
-                    return Err(std::io::Error::from_raw_os_error(-code).into());
-                }
-            }
-            if message.kind >> 8 != SUBSYSTEM >> 8 {
-                continue;
-            }
-            let result = match message.kind & 0xff {
-                0 => detector.notice(TableNotice::New(table(message.payload)?)),
-                2 | 26 => detector.notice(TableNotice::Delete(table(message.payload)?)),
-                15 => match detector.commit(generation(message.payload)?) {
-                    Ok(Some(reload)) => {
-                        log(
-                            "info",
-                            "nftables_reload_confirmed",
-                            json!({"generation":reload.generation}),
-                        );
-                        merge_reloads(&mut output.lock().unwrap().reloads, reload);
-                        Ok(())
-                    }
-                    Ok(None) => Ok(()),
-                    Err(e) => Err(e),
-                },
-                _ => Ok(()),
-            };
-            if let Err(e) = result {
-                recover = Some(e.to_string());
-                break;
-            }
-        }
-        if let Some(reason) = recover {
-            log(
-                "warn",
-                "nftables_notifications_lost",
-                json!({"reason":reason}),
-            );
-            detector = reader.baseline(stop)?;
-        }
+    } else {
+        emit(&mut insns, 0x20, 0, 0, 0);
     }
-    Ok(())
+    emit(&mut insns, 0x61, 0, 0, 0); // LDX | MEM M[0]
+    emit(&mut insns, 0x1d, 1, 0, 0); // JEQ X
+    accepts.push(insns.len());
+    emit(&mut insns, 0x05, 0, 0, 0);
+
+    // Load nlmsg_type at offset 4.
+    emit(&mut insns, 0x28, 0, 0, 4); // LD | H | ABS
+    for kind in [
+        2_u16,
+        4,
+        SUBSYSTEM,
+        SUBSYSTEM | 2,
+        SUBSYSTEM | 15,
+        SUBSYSTEM | 26,
+    ] {
+        emit(
+            &mut insns,
+            0x15, // JMP | JEQ
+            0,
+            1,
+            u16::from_be_bytes(kind.to_ne_bytes()) as u32,
+        );
+        accepts.push(insns.len());
+        emit(&mut insns, 0x05, 0, 0, 0);
+    }
+    emit(&mut insns, 0x06, 0, 0, 0); // RET 0
+    let accept_pos = insns.len();
+    emit(&mut insns, 0x06, 0, 0, u32::MAX); // RET MAX
+    for idx in accepts {
+        insns[idx].k = (accept_pos - idx - 1) as u32;
+    }
+    insns
 }

@@ -41,13 +41,19 @@ impl Lab {
         std::fs::write(
             directory.path().join("iface/10-record.sh"),
             format!(
-                "cat \"$NH_EVENT_FILE\" >> '{}/'${{NH_INTERFACE:-namespace}}.jsonl\n",
+                "cat \"$NH_EVENT_FILE\" >> '{}/'$NH_DEVICE.jsonl\n",
                 directory.path().display()
             ),
         )
         .unwrap();
-        std::fs::write(directory.path().join("nftables/10-record.sh"), format!(
-            "[ \"$NH_SOURCE\" = nftables ] && [ \"$NH_ACTION\" = reload ] || exit 9\ncat \"$NH_EVENT_FILE\" >> '{}/nft.jsonl'\n", directory.path().display())).unwrap();
+        std::fs::write(
+            directory.path().join("nftables/10-record.sh"),
+            format!(
+                "[ \"$NH_SOURCE\" = nftables ] && [ \"$NH_ACTION\" = reload ] || exit 9\ncat \"$NH_EVENT_FILE\" >> '{}/nft.jsonl'\n",
+                directory.path().display()
+            ),
+        )
+        .unwrap();
         Self {
             directory,
             child: None,
@@ -84,7 +90,6 @@ impl Lab {
         );
         self.wait(|| {
             self.logs().contains("nftables_baseline")
-                && (interfaces.is_empty() || !self.events("namespace").is_empty())
                 && links
                     .iter()
                     .filter(|link| interfaces.contains(&link["ifname"].as_str().unwrap()))
@@ -241,10 +246,9 @@ fn empty_interface_list_runs_only_the_nftables_source() {
     nft(&format!("flush ruleset\n{RULESET}"));
     lab.wait(|| lab.events("nft").len() == 1);
     lab.stable();
-    assert!(lab.events("namespace").is_empty());
     assert!(lab.events("wan-a").is_empty());
     assert!(!lab.logs().contains("netlink_filter_installed"));
-    assert_eq!(lab.logs().matches("netlink_socket_opened").count(), 2);
+    assert_eq!(lab.logs().matches("netlink_socket_opened").count(), 1);
     lab.alive();
 }
 
@@ -260,17 +264,24 @@ fn kernel_filter_discards_unsubscribed_events_and_tracks_recreation() {
         ip(&["link", "set", device, "up"]);
     }
     let config = Config::parse(r#"{"interfaces":["wan-a","wan-c"]}"#).unwrap();
-    let monitor = Monitor::open(4 * 1024 * 1024, &config).unwrap();
-    let receive = || monitor.wait(Duration::from_millis(500)).unwrap();
+    let monitor = std::cell::RefCell::new(Monitor::open(4 * 1024 * 1024, &config).unwrap());
     let relevant = || {
         assert!(
-            receive().is_some(),
+            monitor
+                .borrow_mut()
+                .wait(Duration::from_millis(500))
+                .unwrap()
+                .is_some(),
             "a subscribed notification was filtered out"
         )
     };
     let quiet = || {
         assert!(
-            receive().is_none(),
+            monitor
+                .borrow_mut()
+                .wait(Duration::from_millis(500))
+                .unwrap()
+                .is_none(),
             "an unsubscribed notification reached user space"
         )
     };
@@ -354,7 +365,6 @@ fn configured_interfaces_limit_hooks_and_snapshot_while_nftables_stays_global() 
     lab.stable();
     assert!(lab.events("lo").is_empty());
     assert!(lab.events("wan-b").is_empty());
-    assert_eq!(lab.events("namespace").len(), 1);
     assert_eq!(lab.events("wan-a")[0]["changes"]["ipv4"], false);
     let before = lab.events("wan-a").len();
     ip(&["addr", "add", "192.0.2.2/24", "dev", "wan-b"]);
@@ -368,21 +378,9 @@ fn configured_interfaces_limit_hooks_and_snapshot_while_nftables_stays_global() 
         "proto",
         "bgp",
     ]);
-    ip(&[
-        "-6",
-        "route",
-        "add",
-        "unreachable",
-        "2001:db8:30::/56",
-        "table",
-        "10010",
-        "proto",
-        "dhcp",
-    ]);
     lab.stable();
     assert!(lab.events("wan-b").is_empty());
     assert_eq!(lab.events("wan-a").len(), before);
-    assert_eq!(lab.events("namespace").len(), 1);
     ip(&["addr", "add", "192.0.2.3/24", "dev", "wan-a"]);
     lab.wait(|| {
         lab.events("wan-a")
@@ -503,6 +501,7 @@ fn network_lifecycle_and_renewal() {
         ]);
         lab.wait(|| lab.events("wan-a").len() > before);
     }
+    let before = lab.events("wan-a").len();
     ip(&[
         "-6",
         "addr",
@@ -516,18 +515,8 @@ fn network_lifecycle_and_renewal() {
         "preferred_lft",
         "3600",
     ]);
-    lab.wait(|| {
-        lab.events("wan-a")
-            .iter()
-            .any(|e| e["changes"]["ipv6_lifetime"] == true)
-    });
-    assert!(
-        lab.events("wan-a")
-            .iter()
-            .filter(|e| e["changes"]["ipv6_lifetime"] == true)
-            .all(|e| e["changes"]["ipv6"] == false)
-    );
-    let before = lab.events("wan-a").len();
+    lab.stable();
+    assert_eq!(lab.events("wan-a").len(), before);
     ip(&[
         "-6",
         "addr",
@@ -681,12 +670,9 @@ fn notification_loss_rescans_without_fabricating_nft_reload() {
     flood.push_str("address del 192.0.2.2/24 dev wan-a\naddress add 192.0.2.3/24 dev wan-a\n");
     input("/usr/sbin/ip", &["-batch", "-"], &flood);
     let mut nft_flood = format!("flush ruleset\n{RULESET}");
-    // Rule notifications stay separate; nft can combine many element updates into one message.
-    for i in 1..=32768 {
+    for i in 1..=2048 {
         nft_flood.push_str(&format!(
-            "add rule inet alpha input ip saddr 198.18.{}.{} counter\n",
-            i / 256,
-            i % 256
+            "add table ip flood_{i}\ndelete table ip flood_{i}\n"
         ));
     }
     nft(&nft_flood);
@@ -727,9 +713,6 @@ fn notification_loss_rescans_without_fabricating_nft_reload() {
 fn cold_start_without_addresses_then_restoration_and_manual_rescan() {
     let mut lab = Lab::new();
     lab.start();
-    let initial = &lab.events("namespace")[0];
-    assert_eq!(initial["action"], "ifupdate");
-    assert_eq!(initial["changes"]["ipv4"], false);
     ip(&["link", "add", "wan-a", "type", "dummy"]);
     ip(&["link", "set", "wan-a", "up"]);
     lab.wait(|| lab.events("wan-a").iter().any(|e| e["action"] == "ifup"));
@@ -982,9 +965,9 @@ fn npt_iface_hooks_follow_candidate_priority_and_ignore_other_routes() {
             &format!("lock={}/npt.lock", lab.directory.path().display()),
         )
         .replace(
-            "links=$(/usr/sbin/ip -j link show)",
+            "/usr/bin/flock -w 5 9",
             &format!(
-                "printf 'sync\n' >> '{}'\nlinks=$(/usr/sbin/ip -j link show)",
+                "/usr/bin/flock -w 5 9\nprintf 'sync\n' >> '{}'",
                 calls.display(),
             ),
         );

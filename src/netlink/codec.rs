@@ -1,4 +1,4 @@
-use crate::model::{Address, AddressLifetime, Link, NextHop, Route, RouteProperties};
+use crate::model::{Address, Link, NextHop, Route};
 use crate::{Result, error};
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -25,9 +25,6 @@ pub fn messages(bytes: &[u8]) -> Result<Vec<Message<'_>>> {
             payload: &bytes[offset + 16..offset + length],
         });
         offset += aligned(length);
-        if offset > bytes.len() && offset - (aligned(length) - length) != bytes.len() {
-            return Err(error("invalid netlink message padding"));
-        }
     }
     Ok(messages)
 }
@@ -43,9 +40,6 @@ pub fn attrs(bytes: &[u8]) -> Result<BTreeMap<u16, &[u8]>> {
         let kind = u16_at(bytes, offset + 2)? & 0x3fff;
         attributes.insert(kind, &bytes[offset + 4..offset + length]);
         offset += aligned(length);
-        if offset > bytes.len() && offset - (aligned(length) - length) != bytes.len() {
-            return Err(error("invalid netlink attribute padding"));
-        }
     }
     Ok(attributes)
 }
@@ -73,8 +67,9 @@ pub fn address(bytes: &[u8]) -> Result<Option<Address>> {
         .get(&2)
         .or_else(|| a.get(&1))
         .ok_or_else(|| error("address has no local or peer attribute"))?;
-    if byte(bytes, 1)? > if family == 4 { 32 } else { 128 } {
-        return Err(error("address has an invalid prefix length"));
+    let prefix_len = byte(bytes, 1)?;
+    if prefix_len > if family == 4 { 32 } else { 128 } {
+        return Ok(None);
     }
     let local = ip(local, family)?;
     let peer = a
@@ -87,24 +82,16 @@ pub fn address(bytes: &[u8]) -> Result<Option<Address>> {
         .map(|v| u32_at(v, 0))
         .transpose()?
         .unwrap_or(byte(bytes, 2)? as u32);
-    let lifetime = a
-        .get(&6)
-        .map(|v| {
-            Ok::<_, crate::Error>(AddressLifetime {
-                preferred_seconds: u32_at(v, 0)?,
-                valid_seconds: u32_at(v, 4)?,
-                created_centiseconds: u32_at(v, 8)?,
-                updated_centiseconds: u32_at(v, 12)?,
-            })
-        })
-        .transpose()?;
-    let valid = lifetime.as_ref().is_none_or(|l| l.valid_seconds != 0);
-    let usable = flags & (0x08 | 0x40) == 0 && valid;
+    let (preferred_seconds, valid_seconds) = match a.get(&6) {
+        Some(v) => (u32_at(v, 0)?, u32_at(v, 4)?),
+        None => (u32::MAX, u32::MAX),
+    };
+    let usable = flags & (0x08 | 0x40) == 0 && valid_seconds != 0;
     Ok(Some(Address {
         ifindex: u32_at(bytes, 4)?,
         family,
         address: local,
-        prefix_len: byte(bytes, 1)?,
+        prefix_len,
         peer,
         broadcast: a.get(&4).map(|v| ip(v, family)).transpose()?,
         label: a.get(&3).map(|v| text(v)).transpose()?,
@@ -112,15 +99,8 @@ pub fn address(bytes: &[u8]) -> Result<Option<Address>> {
         flags,
         protocol: a.get(&11).map(|v| byte(v, 0)).transpose()?,
         usable,
-        preferred: usable
-            && flags & 0x20 == 0
-            && lifetime.as_ref().is_none_or(|l| l.preferred_seconds != 0),
-        attributes: a
-            .iter()
-            .filter(|(k, _)| ![1, 2, 3, 4, 6, 8, 11].contains(k))
-            .map(|(&k, v)| (k, hex(v)))
-            .collect(),
-        lifetime,
+        preferred: usable && flags & 0x20 == 0 && preferred_seconds != 0,
+        temporary: flags & 0x01 != 0,
     }))
 }
 
@@ -146,50 +126,42 @@ pub fn route(bytes: &[u8]) -> Result<Option<Route>> {
         });
     let prefix_len = byte(bytes, 1)?;
     if prefix_len > if family == 4 { 32 } else { 128 } || (prefix_len > 0 && !a.contains_key(&1)) {
-        return Err(error("route has an invalid destination prefix"));
+        return Ok(None);
     }
     let source_prefix_len = byte(bytes, 2)?;
     if source_prefix_len > if family == 4 { 32 } else { 128 } {
-        return Err(error("route has an invalid source prefix"));
+        return Ok(None);
     }
     Ok(Some(Route {
-        properties: RouteProperties {
-            family,
-            destination: network(&destination, prefix_len, family)?,
-            prefix_len,
-            source: a
-                .get(&2)
-                .map(|v| ip(v, family).and_then(|ip| network(&ip, source_prefix_len, family)))
-                .transpose()?,
-            source_prefix_len,
-            tos: byte(bytes, 3)?,
-            table: a
-                .get(&15)
-                .map(|v| u32_at(v, 0))
-                .transpose()?
-                .unwrap_or(byte(bytes, 4)? as u32),
-            protocol: byte(bytes, 5)?,
-            scope: byte(bytes, 6)?,
-            route_type: byte(bytes, 7)?,
-            flags,
-            output_ifindex: a.get(&4).map(|v| u32_at(v, 0)).transpose()?,
-            input_ifindex: a.get(&3).map(|v| u32_at(v, 0)).transpose()?,
-            gateway: a.get(&5).map(|v| ip(v, family)).transpose()?,
-            preferred_source: a.get(&7).map(|v| ip(v, family)).transpose()?,
-            metric: a.get(&6).map(|v| u32_at(v, 0)).transpose()?.unwrap_or(0),
-            preference: a.get(&20).map(|v| byte(v, 0)).transpose()?,
-            nexthops: a
-                .get(&9)
-                .map(|v| nexthops(v, family))
-                .transpose()?
-                .unwrap_or_default(),
-            attributes: a
-                .iter()
-                .filter(|(k, _)| ![1, 2, 3, 4, 5, 6, 7, 9, 12, 15, 17, 20, 23, 24].contains(k))
-                .map(|(&k, v)| (k, hex(v)))
-                .collect(),
-        },
-        expires: a.get(&23).map(|v| u32_at(v, 0)).transpose()?,
+        family,
+        destination: network(&destination, prefix_len, family)?,
+        prefix_len,
+        source: a
+            .get(&2)
+            .map(|v| ip(v, family).and_then(|ip| network(&ip, source_prefix_len, family)))
+            .transpose()?,
+        source_prefix_len,
+        tos: byte(bytes, 3)?,
+        table: a
+            .get(&15)
+            .map(|v| u32_at(v, 0))
+            .transpose()?
+            .unwrap_or(byte(bytes, 4)? as u32),
+        protocol: byte(bytes, 5)?,
+        scope: byte(bytes, 6)?,
+        route_type: byte(bytes, 7)?,
+        flags,
+        output_ifindex: a.get(&4).map(|v| u32_at(v, 0)).transpose()?,
+        input_ifindex: a.get(&3).map(|v| u32_at(v, 0)).transpose()?,
+        gateway: a.get(&5).map(|v| ip(v, family)).transpose()?,
+        preferred_source: a.get(&7).map(|v| ip(v, family)).transpose()?,
+        metric: a.get(&6).map(|v| u32_at(v, 0)).transpose()?.unwrap_or(0),
+        preference: a.get(&20).map(|v| byte(v, 0)).transpose()?,
+        nexthops: a
+            .get(&9)
+            .map(|v| nexthops(v, family))
+            .transpose()?
+            .unwrap_or_default(),
     }))
 }
 
@@ -207,16 +179,8 @@ fn nexthops(bytes: &[u8], family: u8) -> Result<Vec<NextHop>> {
             weight: byte(bytes, offset + 3)? as u16 + 1,
             flags: byte(bytes, offset + 2)?,
             gateway: a.get(&5).map(|v| ip(v, family)).transpose()?,
-            attributes: a
-                .iter()
-                .filter(|(k, _)| **k != 5)
-                .map(|(&k, v)| (k, hex(v)))
-                .collect(),
         });
         offset += aligned(length);
-        if offset > bytes.len() {
-            return Err(error("invalid multipath padding"));
-        }
     }
     Ok(result)
 }
@@ -265,26 +229,27 @@ fn required<'a>(attrs: &BTreeMap<u16, &'a [u8]>, key: u16) -> Result<&'a [u8]> {
         .copied()
         .ok_or_else(|| error(format!("missing netlink attribute {key}")))
 }
+
 fn text(bytes: &[u8]) -> Result<String> {
     let bytes = bytes
         .strip_suffix(&[0])
         .ok_or_else(|| error("netlink string is not NUL terminated"))?;
     Ok(std::str::from_utf8(bytes)?.to_owned())
 }
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+
 fn tail(bytes: &[u8], at: usize) -> Result<&[u8]> {
     bytes
         .get(at..)
         .ok_or_else(|| error("truncated netlink payload"))
 }
+
 pub fn byte(bytes: &[u8], at: usize) -> Result<u8> {
     bytes
         .get(at)
         .copied()
         .ok_or_else(|| error("truncated netlink byte"))
 }
+
 pub fn u16_at(bytes: &[u8], at: usize) -> Result<u16> {
     Ok(u16::from_ne_bytes(
         bytes
@@ -294,6 +259,7 @@ pub fn u16_at(bytes: &[u8], at: usize) -> Result<u16> {
             .unwrap(),
     ))
 }
+
 pub fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_ne_bytes(
         bytes
@@ -303,6 +269,7 @@ pub fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
             .unwrap(),
     ))
 }
+
 pub fn aligned(length: usize) -> usize {
     (length + 3) & !3
 }

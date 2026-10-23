@@ -3,10 +3,9 @@ set -eu
 umask 077
 
 if [ -n "${NH_EVENT_FILE:-}" ] && [ "${NH_SOURCE:-}" != nftables ]; then
-    /usr/bin/jq -e --arg device "${NH_DEVICE:-}" '
-        if .reason == "startup" then $device == ""
-        else .changes.pd_routes or .changes.interface or
-            (.reason | IN("manual", "netlink_loss", "dump_interrupted")) end
+    /usr/bin/jq -e '
+        .changes.pd_routes or .changes.interface or
+        (.reason | IN("startup", "manual", "netlink_loss", "dump_interrupted"))
     ' "$NH_EVENT_FILE" >/dev/null || exit 0
 fi
 
@@ -17,11 +16,11 @@ lock=/run/lock/network-hotplug-npt.lock
 
 exec 9>"$lock"
 /usr/bin/flock -w 5 9
-links=$(/usr/sbin/ip -j link show)
+links=$(/usr/sbin/ip -j link show ${NH_DEVICE:+dev "$NH_DEVICE"} 2>/dev/null || printf '[]\n')
 
 sync_wan() {
     device=$1
-    if [ -n "${NH_DEVICE:-}" ] && [ "$NH_DEVICE" != "$device" ]; then return 0; fi
+    if [ -n "${NH_DEVICE:-}" ] && [ "${NH_SOURCE:-}" != nftables ] && [ "$NH_DEVICE" != "$device" ]; then return 0; fi
     route_table=$2
     snat=$3
     dnat=$4

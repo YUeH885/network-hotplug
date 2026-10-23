@@ -10,7 +10,6 @@ use serde_json::json;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RESCAN: AtomicBool = AtomicBool::new(false);
@@ -43,7 +42,7 @@ fn run() -> Result<()> {
     }
     let config = Config::load(&options.config)?;
     if options.snapshot {
-        let mut reader = Reader::open(options.receive_buffer_bytes)?;
+        let mut reader = Reader::open(options.receive_buffer_bytes, &config)?;
         match reader.snapshot()? {
             ReadOutcome::Complete(snapshot) => {
                 println!(
@@ -70,10 +69,10 @@ fn run() -> Result<()> {
     } else {
         Some((
             Monitor::open(options.receive_buffer_bytes, &config)?,
-            Reader::open(options.receive_buffer_bytes)?,
+            Reader::open(options.receive_buffer_bytes, &config)?,
         ))
     };
-    let nftables = network_hotplug::nftables::Monitor::open(options.receive_buffer_bytes)?;
+    let mut nftables = network_hotplug::nftables::Monitor::open(options.receive_buffer_bytes)?;
     log(
         "info",
         "started",
@@ -82,11 +81,21 @@ fn run() -> Result<()> {
     let mut scheduler = Scheduler::new(options.clone(), config)?;
     let mut scan = network.is_some().then_some("startup");
     while !STOP.load(Ordering::Relaxed) {
-        if let Some(reloads) = nftables.take()? {
+        if let Some(reloads) = nftables.drain()? {
             scheduler.submit_reload(reloads);
         }
         if RESCAN.swap(false, Ordering::Relaxed) && network.is_some() {
             scan = Some("manual");
+        }
+        if let Some((monitor, _)) = &mut network
+            && let Some(invalidation) = monitor.drain()?
+        {
+            if invalidation.lost {
+                scan = Some("netlink_loss");
+                log("warn", "notifications_lost", json!({"source":"rtnetlink"}));
+            } else if scan.is_none() {
+                scan = Some("kernel");
+            }
         }
         if let Some(reason) = scan
             && let Some((_, reader)) = &mut network
@@ -94,7 +103,11 @@ fn run() -> Result<()> {
             match reader.snapshot()? {
                 ReadOutcome::Complete(snapshot) => {
                     if reason != "kernel" && reason != "startup" {
-                        log("warn", "rescan", json!({"reason":reason}));
+                        log(
+                            if reason == "manual" { "info" } else { "warn" },
+                            "rescan",
+                            json!({"reason":reason}),
+                        );
                     }
                     scheduler.submit(&snapshot, reason);
                     scan = None;
@@ -110,21 +123,36 @@ fn run() -> Result<()> {
                     } else {
                         "dump_interrupted"
                     });
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
                 }
             }
         }
-        if let Some((monitor, _)) = &network {
-            if let Some(invalidation) = monitor.wait(Duration::from_millis(100))? {
-                scan = Some("kernel");
-                if invalidation.lost {
-                    scan = Some("netlink_loss");
-                    log("warn", "notifications_lost", json!({"source":"rtnetlink"}));
-                }
-            }
+        if STOP.load(Ordering::Relaxed) || RESCAN.load(Ordering::Relaxed) {
+            continue;
+        }
+        let timeout_ms = if scan.is_some() || nftables.needs_baseline() {
+            100
         } else {
-            std::thread::sleep(Duration::from_millis(100));
+            -1
+        };
+        let mut fds = [
+            libc::pollfd {
+                fd: nftables.raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: network.as_ref().map_or(-1, |(m, _)| m.raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if network.is_some() { 2 } else { 1 };
+        let res = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+        if res < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e.into());
+            }
         }
     }
     drop(scheduler);

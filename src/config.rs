@@ -27,7 +27,6 @@ impl Config {
         for device in &config.interfaces {
             if device.is_empty()
                 || device.len() >= libc::IFNAMSIZ
-                || [".", ".."].contains(&device.as_str())
                 || device
                     .chars()
                     .any(|c| c.is_whitespace() || ['/', ':', '\0'].contains(&c))
@@ -61,9 +60,8 @@ impl Config {
                 .routes
                 .iter()
                 .filter(|route| {
-                    indices
-                        .iter()
-                        .any(|index| route.properties.uses_device(*index))
+                    route.is_unassociated_pd() && !indices.is_empty()
+                        || indices.iter().any(|index| route.uses_device(*index))
                 })
                 .cloned()
                 .collect(),

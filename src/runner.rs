@@ -5,7 +5,7 @@ use crate::{Result, error};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -89,18 +89,27 @@ impl Drop for EventFile {
 }
 
 pub fn run_hook(options: &Options, directory: &Path, event: &impl ScriptEvent, stop: &AtomicBool) {
-    let details = serde_json::to_value(event).unwrap();
-    log(
-        "info",
-        "dispatch",
-        json!({"id":event.id(),"interface":event.interface(),"hook":directory,
-        "source":details["source"],"action":details["action"],"reason":details["reason"],"changes":details["changes"]}),
-    );
+    let mut dispatch = json!({
+        "id": event.id(),
+        "hook": directory,
+        "source": event.source(),
+        "action": event.action(),
+    });
+    if let Some(device) = event.device() {
+        dispatch["device"] = json!(device);
+    }
+    if let Some(reason) = event.reason() {
+        dispatch["reason"] = json!(reason);
+    }
+    if let Some(changes) = event.changes() {
+        dispatch["changes"] = json!(changes);
+    }
+    log("info", "dispatch", dispatch);
     if let Err(e) = run_scripts(options, directory, event, stop) {
         log(
             "error",
             "hook_failed",
-            json!({"id":event.id(),"interface":event.interface(),"hook":directory,"error":e.to_string()}),
+            json!({"id":event.id(),"device":event.device(),"hook":directory,"error":e.to_string()}),
         );
     }
 }
@@ -121,7 +130,7 @@ fn run_scripts(
             break;
         }
         let mut fields =
-            json!({"id":event.id(),"interface":event.interface(),"hook":directory,"script":path});
+            json!({"id":event.id(),"device":event.device(),"hook":directory,"script":path});
         match run_script(options, directory, event, &event_file.path, &path, stop) {
             Ok((status, elapsed, interrupted)) => {
                 fields["elapsed_ms"] = json!(elapsed.as_millis());
@@ -146,6 +155,31 @@ fn run_scripts(
         }
     }
     Ok(())
+}
+
+fn open_pidfd(pid: u32) -> Option<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd >= 0 {
+        Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    } else {
+        None
+    }
+}
+
+fn wait_pidfd(pidfd: Option<&OwnedFd>, duration: Duration) {
+    if let Some(fd) = pidfd {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = duration.as_millis().min(i32::MAX as u128) as i32;
+        unsafe {
+            libc::poll(&mut poll, 1, timeout_ms);
+        }
+    } else {
+        std::thread::sleep(duration);
+    }
 }
 
 fn run_script(
@@ -173,7 +207,9 @@ fn run_script(
         .stderr(Stdio::inherit())
         .process_group(0)
         .spawn()?;
-    let group = child.id() as i32;
+    let pid = child.id();
+    let pidfd = open_pidfd(pid);
+    let group = pid as i32;
     let mut process = ProcessGroup {
         child,
         group,
@@ -185,9 +221,10 @@ fn run_script(
             process.cleanup();
             return Ok((status, start.elapsed(), None));
         }
+        let elapsed = start.elapsed();
         let reason = if stop.load(Ordering::Relaxed) {
             Some("shutdown")
-        } else if start.elapsed() >= timeout {
+        } else if elapsed >= timeout {
             Some("timeout")
         } else {
             None
@@ -196,7 +233,7 @@ fn run_script(
             log(
                 "error",
                 "script_terminated",
-                json!({"id":event.id(),"interface":event.interface(),"script":script,"reason":reason}),
+                json!({"id":event.id(),"device":event.device(),"script":script,"reason":reason}),
             );
             terminate_group(group, libc::SIGTERM);
             let grace = Instant::now();
@@ -204,12 +241,16 @@ fn run_script(
                 if process.child.try_wait()?.is_some() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                let remain = Duration::from_secs(1)
+                    .saturating_sub(grace.elapsed())
+                    .min(Duration::from_millis(50));
+                wait_pidfd(pidfd.as_ref(), remain);
             }
             process.cleanup();
             return Ok((process.child.wait()?, start.elapsed(), Some(reason)));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let step = (timeout - elapsed).min(Duration::from_millis(50));
+        wait_pidfd(pidfd.as_ref(), step);
     }
 }
 
@@ -244,12 +285,6 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.cleanup();
-        if let Err(e) = self.child.wait() {
-            log(
-                "error",
-                "child_reap_failed",
-                json!({"group":self.group,"error":e.to_string()}),
-            );
-        }
+        let _ = self.child.wait();
     }
 }

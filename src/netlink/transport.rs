@@ -5,6 +5,9 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+const SOL_NETLINK: i32 = 270;
+const NETLINK_GET_STRICT_CHK: i32 = 12;
+
 pub enum Datagram<'a> {
     Data(&'a [u8]),
     Empty,
@@ -17,6 +20,10 @@ pub struct Socket {
 }
 
 impl Socket {
+    pub fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
     pub fn attach_filter(&self, instructions: &mut [libc::sock_filter]) -> Result<()> {
         let program = libc::sock_fprog {
             len: instructions.len().try_into()?,
@@ -40,6 +47,23 @@ impl Socket {
         Ok(())
     }
 
+    pub fn enable_strict_check(&self) -> Result<()> {
+        let enabled = 1_i32;
+        if unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                SOL_NETLINK,
+                NETLINK_GET_STRICT_CHK,
+                (&enabled as *const i32).cast(),
+                mem::size_of::<i32>() as u32,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
     pub fn open(groups: u32, receive_buffer: i32) -> Result<Self> {
         Self::open_protocol(libc::NETLINK_ROUTE, groups, receive_buffer)
     }
@@ -57,7 +81,7 @@ impl Socket {
         }
         let socket = Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
-            buffer: vec![0; 1024 * 1024],
+            buffer: vec![0; 64 * 1024],
         };
         let mut address: libc::sockaddr_nl = unsafe { mem::zeroed() };
         address.nl_family = libc::AF_NETLINK as u16;
@@ -106,16 +130,18 @@ impl Socket {
         {
             return Err(io::Error::last_os_error().into());
         }
-        log(
-            if effective_buffer < receive_buffer.saturating_mul(2) {
-                "warn"
-            } else {
-                "info"
-            },
-            "netlink_socket_opened",
-            json!({"protocol":protocol,"groups":groups,"requested_buffer_bytes":receive_buffer,
-                "effective_buffer_bytes":effective_buffer}),
-        );
+        if groups != 0 {
+            log(
+                if effective_buffer < receive_buffer.saturating_mul(2) {
+                    "warn"
+                } else {
+                    "info"
+                },
+                "netlink_socket_opened",
+                json!({"protocol":protocol,"groups":groups,"requested_buffer_bytes":receive_buffer,
+                    "effective_buffer_bytes":effective_buffer}),
+            );
+        }
         Ok(socket)
     }
 
@@ -188,7 +214,7 @@ impl Socket {
             return Err(error("netlink returned EOF"));
         }
         if sender.nl_pid != 0 {
-            return Err(error("netlink datagram did not originate from the kernel"));
+            return Ok(Datagram::Empty);
         }
         if received as usize > self.buffer.len() {
             return Ok(Datagram::Lost);

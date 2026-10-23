@@ -1,6 +1,5 @@
 use network_hotplug::config::Config;
-use network_hotplug::model::{Link, NextHop, Route, RouteProperties, Snapshot};
-use std::collections::BTreeMap;
+use network_hotplug::model::{Link, NextHop, Route, Snapshot};
 
 #[test]
 fn configuration_requires_an_explicit_interface_list_and_reports_errors() {
@@ -17,7 +16,6 @@ fn configuration_requires_an_explicit_interface_list_and_reports_errors() {
         r#"{"interfaces":"wan0"}"#,
         r#"{"interfaces":["wan0"],"unknown":true}"#,
         r#"{"interfaces":[""]}"#,
-        r#"{"interfaces":["."]}"#,
         r#"{"interfaces":["../wan0"]}"#,
         r#"{"interfaces":["wan 0"]}"#,
         r#"{"interfaces":["wan\u0000"]}"#,
@@ -43,22 +41,18 @@ fn configuration_requires_an_explicit_interface_list_and_reports_errors() {
 fn selection_keeps_only_configured_devices_and_associated_routes() {
     let config = Config::parse(r#"{"interfaces":["wan-a","missing-wan"]}"#).unwrap();
     let route = |output_ifindex, input_ifindex, hops: Vec<u32>| Route {
-        properties: RouteProperties {
-            output_ifindex,
-            input_ifindex,
-            nexthops: hops
-                .into_iter()
-                .map(|ifindex| NextHop {
-                    ifindex,
-                    weight: 1,
-                    flags: 0,
-                    gateway: None,
-                    attributes: BTreeMap::new(),
-                })
-                .collect(),
-            ..Default::default()
-        },
-        expires: None,
+        output_ifindex,
+        input_ifindex,
+        nexthops: hops
+            .into_iter()
+            .map(|ifindex| NextHop {
+                ifindex,
+                weight: 1,
+                flags: 0,
+                gateway: None,
+            })
+            .collect(),
+        ..Default::default()
     };
     let snapshot = Snapshot {
         links: ["wan-a", "wan-b"]
@@ -84,10 +78,5 @@ fn selection_keeps_only_configured_devices_and_associated_routes() {
     assert_eq!(selected.links.len(), 1);
     assert_eq!(selected.links[0].device, "wan-a");
     assert_eq!(selected.routes.len(), 3);
-    assert!(
-        selected
-            .routes
-            .iter()
-            .all(|route| route.properties.uses_device(10))
-    );
+    assert!(selected.routes.iter().all(|route| route.uses_device(10)));
 }

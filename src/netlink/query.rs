@@ -12,8 +12,12 @@ pub struct Query {
 
 impl Query {
     pub fn open(protocol: i32, buffer_size: i32) -> Result<Self> {
+        let socket = Socket::open_protocol(protocol, 0, buffer_size)?;
+        if protocol == libc::NETLINK_ROUTE {
+            socket.enable_strict_check()?;
+        }
         Ok(Self {
-            socket: Socket::open_protocol(protocol, 0, buffer_size)?,
+            socket,
             protocol,
             buffer_size,
             sequence: 0,
@@ -50,8 +54,11 @@ impl Query {
             let bytes = match self.socket.receive()? {
                 Datagram::Empty => continue,
                 Datagram::Lost => {
-                    // Abandon the old socket so late replies cannot enter the next query.
-                    self.socket = Socket::open_protocol(self.protocol, 0, self.buffer_size)?;
+                    let socket = Socket::open_protocol(self.protocol, 0, self.buffer_size)?;
+                    if self.protocol == libc::NETLINK_ROUTE {
+                        socket.enable_strict_check()?;
+                    }
+                    self.socket = socket;
                     return Ok(None);
                 }
                 Datagram::Data(bytes) => bytes,
@@ -67,6 +74,10 @@ impl Query {
                             let code = codec::u32_at(message.payload, 0)? as i32;
                             if message.kind == 3 && code == -libc::EINTR {
                                 interrupted = true;
+                            } else if !dump
+                                && [-libc::ENODEV, -libc::ENXIO, -libc::ESRCH].contains(&code)
+                            {
+                                return Ok(Some(Vec::new()));
                             } else if code != 0 {
                                 return Err(std::io::Error::from_raw_os_error(-code).into());
                             }

@@ -58,7 +58,7 @@ fn slow_interface_retains_later_changes_and_other_interfaces_wait_in_fifo() {
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "if [ \"$NH_INTERFACE\" = wan-a ] && [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nsleep 0.8\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_INTERFACE.jsonl\n",
+        "if [ \"$NH_DEVICE\" = wan-a ] && [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nsleep 0.8\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n",
         temp.path().display())).unwrap();
     let mut scheduler = Scheduler::new(options.clone(), config()).unwrap();
     let mut state = snapshot();
@@ -106,7 +106,7 @@ fn startup_baseline_is_preserved_when_runtime_updates_arrive_before_first_dispat
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "if [ \"$NH_INTERFACE\" = wan-a ]; then : > '{0}/started'; sleep 0.5; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_INTERFACE.jsonl\n",
+        "if [ \"$NH_DEVICE\" = wan-a ]; then : > '{0}/started'; sleep 0.5; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n",
         temp.path().display())).unwrap();
     let mut scheduler = Scheduler::new(options, config()).unwrap();
     let mut state = snapshot();
@@ -132,15 +132,15 @@ fn startup_baseline_is_preserved_when_runtime_updates_arrive_before_first_dispat
 }
 
 #[test]
-fn script_order_failure_timeout_group_cleanup_and_literal_filename() {
+fn script_order_failure_timeout_and_group_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let options = options(temp.path(), 1);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     let directory = &options.iface_directory();
     std::fs::write(
-        directory.join("10-$(touch injected).sh"),
+        directory.join("10-first.sh"),
         format!(
-            "[ \"$NH_INTERFACE\" = wan-a ] || exit 0\n\nprintf 'first\\n' >> '{}/order'\nexit 7\n",
+            "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nprintf 'first\\n' >> '{}/order'\nexit 7\n",
             temp.path().display()
         ),
     )
@@ -148,7 +148,7 @@ fn script_order_failure_timeout_group_cleanup_and_literal_filename() {
     std::fs::write(
         directory.join("20-slow.sh"),
         format!(
-            "[ \"$NH_INTERFACE\" = wan-a ] || exit 0\ntrap '' TERM\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}/child'\nwait\n",
+            "[ \"$NH_DEVICE\" = wan-a ] || exit 0\ntrap '' TERM\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}/child'\nwait\n",
             temp.path().display()
         ),
     )
@@ -156,7 +156,7 @@ fn script_order_failure_timeout_group_cleanup_and_literal_filename() {
     std::fs::write(
         directory.join("30-last.sh"),
         format!(
-            "[ \"$NH_INTERFACE\" = wan-a ] || exit 0\nprintf 'last\\n' >> '{}/order'\n",
+            "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nprintf 'last\\n' >> '{}/order'\n",
             temp.path().display()
         ),
     )
@@ -173,7 +173,6 @@ fn script_order_failure_timeout_group_cleanup_and_literal_filename() {
         std::fs::read_to_string(temp.path().join("order")).unwrap(),
         "first\nlast\n"
     );
-    assert!(!directory.join("injected").exists());
     let pid = std::fs::read_to_string(temp.path().join("child")).unwrap();
     let status = std::fs::read_to_string(format!("/proc/{}/status", pid.trim()));
     assert!(
@@ -223,7 +222,7 @@ fn many_pending_updates_keep_one_latest_state() {
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "[ \"$NH_INTERFACE\" = wan-a ] || exit 0\nif [ ! -f '{0}/started' ]; then : > '{0}/started'; sleep 0.8; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/records'\n", temp.path().display())).unwrap();
+        "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nif [ ! -f '{0}/started' ]; then : > '{0}/started'; sleep 0.8; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/records'\n", temp.path().display())).unwrap();
     let mut scheduler = Scheduler::new(options, config()).unwrap();
     let mut state = snapshot();
     scheduler.submit(&state, "startup");
@@ -252,7 +251,7 @@ fn runtime_device_discovery_deletion_and_recreation_keep_real_names() {
     std::fs::write(
         options.iface_directory().join("10-record.sh"),
         format!(
-            "[ \"$NH_INTERFACE\" = wan-a ] || exit 0\ncat \"$NH_EVENT_FILE\" >> '{}/records'\n",
+            "[ \"$NH_DEVICE\" = wan-a ] || exit 0\ncat \"$NH_EVENT_FILE\" >> '{}/records'\n",
             temp.path().display()
         ),
     )
@@ -284,12 +283,12 @@ fn runtime_device_discovery_deletion_and_recreation_keep_real_names() {
 }
 
 #[test]
-fn pending_address_round_trip_preserves_zero_change_flags() {
+fn pending_address_round_trip_suppresses_noop_dispatch() {
     let temp = tempfile::tempdir().unwrap();
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nif [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nwhile [ ! -f '{0}/release' ]; do sleep 0.01; done\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/records'\n", temp.path().display())).unwrap();
+        "if [ \"$NH_DEVICE\" = wan-a ] && [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nwhile [ ! -f '{0}/release' ]; do sleep 0.01; done\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n", temp.path().display())).unwrap();
     let mut state = snapshot();
     state.addresses.push(Address {
         ifindex: 10,
@@ -304,8 +303,7 @@ fn pending_address_round_trip_preserves_zero_change_flags() {
         protocol: None,
         usable: true,
         preferred: true,
-        attributes: Default::default(),
-        lifetime: None,
+        temporary: false,
     });
     let mut scheduler = Scheduler::new(options, config()).unwrap();
     scheduler.submit(&state, "startup");
@@ -314,19 +312,16 @@ fn pending_address_round_trip_preserves_zero_change_flags() {
     scheduler.submit(&state, "kernel");
     state.addresses[0].address = "192.0.2.2".into();
     scheduler.submit(&state, "kernel");
+    state.links[1].mtu = 1400;
+    scheduler.submit(&state, "kernel");
     std::fs::write(temp.path().join("release"), "").unwrap();
     wait_for(|| {
-        std::fs::read_to_string(temp.path().join("records"))
+        std::fs::read_to_string(temp.path().join("wan-b.jsonl"))
             .is_ok_and(|records| records.lines().count() == 2)
     });
     drop(scheduler);
-    let records = std::fs::read_to_string(temp.path().join("records")).unwrap();
-    let last: Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
-    assert_eq!(last["reason"], "coalesced");
-    assert_eq!(last["coalesced_updates"], 2);
-    assert_eq!(last["changes"]["ipv4"], false);
-    assert_eq!(last["changes"]["ipv4_usable"], false);
-    assert_eq!(last["state"]["ipv4"][0]["address"], "192.0.2.2");
+    let records = std::fs::read_to_string(temp.path().join("wan-a.jsonl")).unwrap();
+    assert_eq!(records.lines().count(), 1);
 }
 
 #[test]

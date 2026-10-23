@@ -1,14 +1,18 @@
-use crate::model::{Address, Link, Route, RouteProperties, Snapshot};
+use crate::model::{Address, Link, Route, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub trait ScriptEvent: Serialize {
     fn id(&self) -> u64;
-    fn interface(&self) -> Option<&str>;
+    fn device(&self) -> Option<&str>;
+    fn source(&self) -> &str;
+    fn action(&self) -> &str;
+    fn reason(&self) -> Option<&str>;
+    fn changes(&self) -> Option<&Changes>;
     fn environment(&self) -> BTreeMap<String, String>;
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct View {
     pub link: Option<Link>,
     pub ipv4: Vec<Address>,
@@ -28,18 +32,15 @@ impl View {
         let routes = snapshot
             .routes
             .iter()
-            .filter(|route| index.is_some_and(|i| route.properties.uses_device(i)))
+            .filter(|route| {
+                index.is_some_and(|i| route.uses_device(i) || route.is_unassociated_pd())
+            })
             .cloned()
             .collect::<Vec<_>>();
         let pd_prefixes = routes
             .iter()
-            .filter(|route| route.properties.is_pd_candidate())
-            .map(|route| {
-                format!(
-                    "{}/{}",
-                    route.properties.destination, route.properties.prefix_len
-                )
-            })
+            .filter(|route| route.is_pd_candidate())
+            .map(|route| format!("{}/{}", route.destination, route.prefix_len))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -74,8 +75,6 @@ pub struct Changes {
     pub ipv6: bool,
     pub ipv4_attributes: bool,
     pub ipv6_attributes: bool,
-    pub ipv4_lifetime: bool,
-    pub ipv6_lifetime: bool,
     pub ipv4_usable: bool,
     pub ipv6_usable: bool,
     pub routes: bool,
@@ -88,19 +87,15 @@ pub struct Changes {
 
 impl Changes {
     pub fn between(old: &View, new: &View) -> Self {
-        let (ipv4, ipv4_attributes, ipv4_lifetime, ipv4_usable) =
-            address_changes(&old.ipv4, &new.ipv4);
-        let (ipv6, ipv6_attributes, ipv6_lifetime, ipv6_usable) =
-            address_changes(&old.ipv6, &new.ipv6);
-        let old_routes = route_properties(&old.routes);
-        let new_routes = route_properties(&new.routes);
+        let (ipv4, ipv4_attributes, ipv4_usable) = address_changes(&old.ipv4, &new.ipv4);
+        let (ipv6, ipv6_attributes, ipv6_usable) = address_changes(&old.ipv6, &new.ipv6);
+        let old_routes = old.routes.iter().collect::<BTreeSet<_>>();
+        let new_routes = new.routes.iter().collect::<BTreeSet<_>>();
         let old_map = route_groups(&old.routes);
         let new_map = route_groups(&new.routes);
-        let route_attributes = old_map.iter().any(|(key, properties)| {
-            new_map
-                .get(key)
-                .is_some_and(|current| properties != current)
-        });
+        let route_attributes = old_map
+            .iter()
+            .any(|(key, routes)| new_map.get(key).is_some_and(|current| routes != current));
         Self {
             interface: old.link.as_ref().map(|l| l.ifindex) != new.link.as_ref().map(|l| l.ifindex),
             link: old.link != new.link,
@@ -112,8 +107,6 @@ impl Changes {
             ipv6,
             ipv4_attributes,
             ipv6_attributes,
-            ipv4_lifetime,
-            ipv6_lifetime,
             ipv4_usable,
             ipv6_usable,
             routes: old_routes != new_routes,
@@ -121,13 +114,13 @@ impl Changes {
             route_attributes,
             default_route: !old_routes
                 .iter()
-                .filter(|p| p.prefix_len == 0)
-                .eq(new_routes.iter().filter(|p| p.prefix_len == 0)),
+                .filter(|r| r.prefix_len == 0)
+                .eq(new_routes.iter().filter(|r| r.prefix_len == 0)),
             pd: old.pd_prefixes != new.pd_prefixes,
             pd_routes: !old_routes
                 .iter()
-                .filter(|route| route.is_pd_candidate())
-                .eq(new_routes.iter().filter(|route| route.is_pd_candidate())),
+                .filter(|r| r.is_pd_candidate())
+                .eq(new_routes.iter().filter(|r| r.is_pd_candidate())),
         }
     }
 
@@ -136,42 +129,21 @@ impl Changes {
     }
 }
 
-fn address_groups(addresses: &[Address]) -> BTreeMap<&str, Vec<&Address>> {
-    let mut groups: BTreeMap<&str, Vec<&Address>> = BTreeMap::new();
+fn address_groups(addresses: &[Address]) -> BTreeMap<&str, BTreeSet<&Address>> {
+    let mut groups: BTreeMap<&str, BTreeSet<&Address>> = BTreeMap::new();
     for address in addresses {
-        groups.entry(address.identity()).or_default().push(address);
+        groups.entry(&address.address).or_default().insert(address);
     }
     groups
 }
 
-fn address_changes(old: &[Address], new: &[Address]) -> (bool, bool, bool, bool) {
+fn address_changes(old: &[Address], new: &[Address]) -> (bool, bool, bool) {
     let old_map = address_groups(old);
     let new_map = address_groups(new);
     let changed = !old_map.keys().eq(new_map.keys());
-    let attributes = old_map.iter().any(|(key, addresses)| {
-        new_map.get(key).is_some_and(|current| {
-            addresses
-                .iter()
-                .map(|a| a.properties())
-                .collect::<BTreeSet<_>>()
-                != current
-                    .iter()
-                    .map(|a| a.properties())
-                    .collect::<BTreeSet<_>>()
-        })
-    });
-    let lifetime = old_map.iter().any(|(key, addresses)| {
-        new_map.get(key).is_some_and(|current| {
-            addresses
-                .iter()
-                .map(|a| a.lifetime_stamp())
-                .collect::<BTreeSet<_>>()
-                != current
-                    .iter()
-                    .map(|a| a.lifetime_stamp())
-                    .collect::<BTreeSet<_>>()
-        })
-    });
+    let attributes = old_map
+        .iter()
+        .any(|(key, addresses)| new_map.get(key).is_some_and(|current| addresses != current));
     let usable = old
         .iter()
         .filter(|a| a.usable)
@@ -182,20 +154,13 @@ fn address_changes(old: &[Address], new: &[Address]) -> (bool, bool, bool, bool)
             .filter(|a| a.usable)
             .map(|a| a.identity())
             .collect::<BTreeSet<_>>();
-    (changed, attributes, lifetime, usable)
+    (changed, attributes, usable)
 }
 
-fn route_properties(routes: &[Route]) -> BTreeSet<&RouteProperties> {
-    routes.iter().map(|route| &route.properties).collect()
-}
-
-fn route_groups(routes: &[Route]) -> BTreeMap<impl Ord + '_, BTreeSet<&RouteProperties>> {
+fn route_groups(routes: &[Route]) -> BTreeMap<impl Ord + '_, BTreeSet<&Route>> {
     let mut groups = BTreeMap::<_, BTreeSet<_>>::new();
     for route in routes {
-        groups
-            .entry(route.properties.identity())
-            .or_default()
-            .insert(&route.properties);
+        groups.entry(route.identity()).or_default().insert(route);
     }
     groups
 }
@@ -253,7 +218,6 @@ pub struct Event {
     pub id: u64,
     pub source: String,
     pub action: String,
-    pub interface: String,
     pub device: String,
     pub reason: String,
     pub coalesced_updates: u64,
@@ -276,7 +240,7 @@ impl Event {
             .map(|old| Changes::between(old, &new))
             .unwrap_or_default();
         let baseline = old.is_none();
-        let recovery = reason != "kernel" && reason != "startup";
+        let recovery = matches!(reason, "manual" | "netlink_loss" | "dump_interrupted");
         if !baseline && !recovery && !changes.any() {
             return None;
         }
@@ -285,9 +249,7 @@ impl Event {
             .as_ref()
             .and_then(|v| v.link.as_ref())
             .is_some_and(|l| l.admin_up);
-        let action = if device.is_empty() {
-            "ifupdate"
-        } else if baseline {
+        let action = if baseline {
             if up { "ifup" } else { "ifdown" }
         } else if up && (!old_up || changes.interface) {
             "ifup"
@@ -305,10 +267,10 @@ impl Event {
                     .chain(new.ipv6.iter().map(|a| a.family)),
             );
         }
-        if changes.ipv4 || changes.ipv4_attributes || changes.ipv4_lifetime || changes.ipv4_usable {
+        if changes.ipv4 || changes.ipv4_attributes || changes.ipv4_usable {
             families.insert(4);
         }
-        if changes.ipv6 || changes.ipv6_attributes || changes.ipv6_lifetime || changes.ipv6_usable {
+        if changes.ipv6 || changes.ipv6_attributes || changes.ipv6_usable {
             families.insert(6);
         }
         let mut tables = BTreeSet::new();
@@ -317,9 +279,9 @@ impl Event {
         if baseline || recovery || changes.routes {
             let old_routes = old
                 .iter()
-                .flat_map(|view| view.routes.iter().map(|route| &route.properties))
+                .flat_map(|view| view.routes.iter())
                 .collect::<BTreeSet<_>>();
-            let new_routes = route_properties(&new.routes);
+            let new_routes = new.routes.iter().collect::<BTreeSet<_>>();
             for route in old_routes.union(&new_routes) {
                 if baseline
                     || recovery
@@ -338,7 +300,6 @@ impl Event {
             id,
             source: "rtnetlink".into(),
             action: action.into(),
-            interface: device.into(),
             device: device.into(),
             reason: reason.into(),
             coalesced_updates,
@@ -357,7 +318,6 @@ impl Event {
         let mut env = BTreeMap::from([
             ("NH_SOURCE".into(), self.source.clone()),
             ("NH_ACTION".into(), self.action.clone()),
-            ("NH_INTERFACE".into(), self.interface.clone()),
             ("NH_DEVICE".into(), self.device.clone()),
             (
                 "NH_IFINDEX".into(),
@@ -381,8 +341,20 @@ impl ScriptEvent for Event {
     fn id(&self) -> u64 {
         self.id
     }
-    fn interface(&self) -> Option<&str> {
-        Some(&self.interface)
+    fn device(&self) -> Option<&str> {
+        Some(&self.device)
+    }
+    fn source(&self) -> &str {
+        &self.source
+    }
+    fn action(&self) -> &str {
+        &self.action
+    }
+    fn reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+    fn changes(&self) -> Option<&Changes> {
+        Some(&self.changes)
     }
     fn environment(&self) -> BTreeMap<String, String> {
         Event::environment(self)
