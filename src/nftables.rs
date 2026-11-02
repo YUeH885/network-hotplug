@@ -64,27 +64,33 @@ impl Detector {
         if generation != self.generation.wrapping_add(1).max(1) {
             return Err(error("nftables generation gap"));
         }
-        let mut created = false;
+        let prior_tables = self.tables.clone();
+        let mut deleted = Vec::new();
+        let mut created = Vec::new();
         for notice in self.transaction.drain(..) {
             match notice {
                 TableNotice::Delete(table) => {
-                    if !self.tables.remove(&table) {
-                        return Err(error("nftables deletion is inconsistent with the baseline"));
-                    }
-                    if self.tables.is_empty() {
-                        self.cleared = true;
-                        created = false;
-                    }
+                    self.tables.remove(&table);
+                    deleted.push(table);
                 }
                 TableNotice::New(table) => {
-                    if self.tables.insert(table) && self.cleared {
-                        created = true;
+                    if self.tables.insert(table.clone()) {
+                        created.push(table);
                     }
                 }
             }
         }
         self.generation = generation;
-        if self.cleared && created && !self.tables.is_empty() {
+
+        let deleted_from_prior = deleted.iter().filter(|t| prior_tables.contains(t)).count();
+        let prior_empty_after_deletes =
+            !prior_tables.is_empty() && prior_tables.iter().all(|t| deleted.contains(t));
+
+        let is_clear = !prior_tables.is_empty()
+            && (prior_empty_after_deletes
+                || (deleted_from_prior >= 2 && deleted_from_prior * 2 >= prior_tables.len()));
+
+        if (is_clear || self.cleared) && !created.is_empty() && !self.tables.is_empty() {
             self.cleared = false;
             return Ok(Some(Reloads {
                 count: 1,
@@ -92,6 +98,11 @@ impl Detector {
                 tables: self.tables.iter().cloned().collect(),
             }));
         }
+
+        if is_clear && created.is_empty() {
+            self.cleared = true;
+        }
+
         Ok(None)
     }
 }

@@ -50,7 +50,7 @@ exec /usr/sbin/conntrack -F
 
 nftables 在整个规则集清空、重建并提交后调用 `nftables/` 目录，动作仅为 `reload`。判定支持同一事务加载和分步加载。
 
-[业务接入](docs/integration.md) 提供 DDNS、NPT、CAKE、重拨与可选连接跟踪脚本的安装和调用方法。设备条件、带宽、域名、route table 和 map 名在对应脚本中设置。
+[业务接入](docs/integration.md) 说明 DDNS、NPT、CAKE、重拨与可选连接跟踪脚本的设计与调用规则。设备条件、带宽、域名、route table 和 map 名在对应脚本中设置。
 
 ## 构建与验证
 
@@ -64,25 +64,12 @@ cargo build --release --offline
 
 内核测试在独立 network namespace 中运行，步骤与覆盖场景见 [隔离验证](docs/validation.md)。
 
-## 安装与运行
+## 运行与参数
 
-在目标设备安装二进制、配置、服务和所需脚本：
+程序以 root 运行。运行目录 `/run/network-hotplug/` 的权限为 `0700`，事件文件为 `0600`。每个脚本执行超时为 30 秒，超时或中断向子进程组发送 `SIGTERM`，并在 1 秒后发送 `SIGKILL` 清理进程；脚本正常退出时不向进程组发送信号。
 
-```sh
-install -m 0755 target/release/network-hotplug /usr/local/bin/network-hotplug
-install -m 0644 config/network-hotplug.json.example /etc/network-hotplug.json
-install -d -m 0755 /etc/network-hotplug.d/iface /etc/network-hotplug.d/nftables
-install -m 0644 systemd/network-hotplug.service /etc/systemd/system/network-hotplug.service
-systemctl daemon-reload
-```
-
-将配置中的 `interfaces` 改为实际设备名，然后启动：
-
-```sh
-systemctl enable --now network-hotplug.service
-journalctl -u network-hotplug.service -f
-```
-
-服务以 root 运行，在 networkd 与 nftables 之后启动。运行目录 `/run/network-hotplug/` 的权限为 `0700`，事件文件为 `0600`；脚本 stdout/stderr 进入 journal。每个脚本超时为 30 秒，终止进程组时给予 1 秒退出时间。
-
-`--config FILE` 指定配置文件，`--snapshot` 输出选中设备的内核快照。`--hooks DIR` 和 `--runtime-dir DIR` 指定替代目录。`SIGHUP` 重新核对状态，保留比较基线；修改配置后执行 `systemctl restart network-hotplug.service`。
+- `--config FILE`：指定配置文件路径（默认 `/etc/network-hotplug.json`）。
+- `--snapshot`：按配置接口输出当前的规范化状态 JSON 快照并退出。
+- `--hooks DIR`：指定脚本根目录（默认 `/etc/network-hotplug.d`）。
+- `--runtime-dir DIR`：指定临时事件与锁目录（默认 `/run/network-hotplug`）。
+- `SIGHUP`：触发全量状态核对，保留内部比较基线。修改配置文件后需重启服务。

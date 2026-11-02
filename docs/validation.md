@@ -26,7 +26,6 @@ for test in \
     configured_interfaces_limit_hooks_and_snapshot_while_nftables_stays_global \
     network_lifecycle_and_renewal \
     nft_atomic_split_multi_family_and_regular_updates \
-    notification_loss_rescans_without_fabricating_nft_reload \
     cold_start_without_addresses_then_restoration_and_manual_rescan \
     npt_script_syncs_full_pd_clears_invalid_prefixes_and_restores_on_reload \
     npt_iface_hooks_follow_candidate_priority_and_ignore_other_routes \

@@ -234,16 +234,13 @@ impl Event {
         new: View,
         reason: &str,
         coalesced_updates: u64,
-    ) -> Option<Self> {
+    ) -> Self {
         let changes = old
             .as_ref()
             .map(|old| Changes::between(old, &new))
             .unwrap_or_default();
         let baseline = old.is_none();
         let recovery = matches!(reason, "manual" | "netlink_loss" | "dump_interrupted");
-        if !baseline && !recovery && !changes.any() {
-            return None;
-        }
         let up = new.link.as_ref().is_some_and(|l| l.admin_up);
         let old_up = old
             .as_ref()
@@ -295,7 +292,7 @@ impl Event {
                 }
             }
         }
-        Some(Self {
+        Self {
             version: 1,
             id,
             source: "rtnetlink".into(),
@@ -311,7 +308,7 @@ impl Event {
                 route_types: types.into_iter().collect(),
             },
             state: new.into(),
-        })
+        }
     }
 
     pub fn environment(&self) -> BTreeMap<String, String> {

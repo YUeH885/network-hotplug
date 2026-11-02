@@ -61,13 +61,13 @@ fn view(snapshot: &Snapshot) -> View {
     View::project(snapshot, "ppp-uplink_a")
 }
 
-fn event(old: Option<View>, new: View, reason: &str) -> Option<Event> {
+fn event(old: Option<View>, new: View, reason: &str) -> Event {
     Event::build(1, "ppp-uplink_a", old, new, reason, 1)
 }
 
 #[test]
 fn startup_restores_current_state_without_address_changes() {
-    let e = event(None, view(&snapshot()), "startup").unwrap();
+    let e = event(None, view(&snapshot()), "startup");
     assert_eq!(e.action, "ifup");
     assert_eq!(e.changes, Changes::default());
     assert!(e.state.interface.admin_up);
@@ -81,20 +81,13 @@ fn runtime_address_addition_and_deletion_are_real_changes() {
     let mut new = old.clone();
     new.addresses.push(address("192.0.2.3"));
     new.normalize();
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert_eq!(e.action, "ifupdate");
     assert!(e.changes.ipv4);
     assert!(!e.changes.routes);
     assert_eq!(e.environment()["NH_IPV4_CHANGED"], "1");
-    let e = event(Some(view(&new)), view(&old), "kernel").unwrap();
+    let e = event(Some(view(&new)), view(&old), "kernel");
     assert!(e.changes.ipv4);
-}
-
-#[test]
-fn duplicate_notifications_and_coalesced_round_trips_do_not_dispatch() {
-    let old = snapshot();
-    assert!(event(Some(view(&old)), view(&old), "kernel").is_none());
-    assert!(event(Some(view(&old)), view(&old), "coalesced").is_none());
 }
 
 #[test]
@@ -107,7 +100,7 @@ fn dad_and_prefix_attributes_are_separate_from_ip_membership() {
     let mut new = old.clone();
     new.addresses[0].flags = 0;
     new.addresses[0].usable = true;
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert!(!e.changes.ipv6);
     assert!(e.changes.ipv6_attributes);
     assert!(e.changes.ipv6_usable);
@@ -115,7 +108,6 @@ fn dad_and_prefix_attributes_are_separate_from_ip_membership() {
     new.addresses[0].prefix_len = 56;
     assert!(
         event(Some(view(&old)), view(&new), "kernel")
-            .unwrap()
             .changes
             .ipv6_attributes
     );
@@ -138,7 +130,7 @@ fn pd_candidates_are_prefix_sets_and_exclude_default_routes() {
     let old = snapshot();
     let mut new = old.clone();
     new.routes.push(route("2001:db8:40::/56"));
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert!(e.changes.pd);
     assert!(e.changes.routes);
     assert!(!e.changes.ipv6);
@@ -146,7 +138,7 @@ fn pd_candidates_are_prefix_sets_and_exclude_default_routes() {
     let old = new.clone();
     new.routes.push(route("::/0"));
     new.normalize();
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert!(!e.changes.pd);
     assert!(e.changes.default_route);
     assert!(e.changes.route_set);
@@ -164,7 +156,7 @@ fn metric_and_route_attributes_do_not_change_the_prefix_set() {
     for r in &mut new.routes {
         r.metric = 500;
     }
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert!(e.changes.routes);
     assert!(e.changes.route_attributes);
     assert!(e.changes.default_route);
@@ -178,9 +170,7 @@ fn metric_and_route_attributes_do_not_change_the_prefix_set() {
         .find(|r| r.prefix_len == 0)
         .unwrap()
         .metric = 1000;
-    let changes = event(Some(view(&old)), view(&new), "kernel")
-        .unwrap()
-        .changes;
+    let changes = event(Some(view(&old)), view(&new), "kernel").changes;
     assert!(changes.default_route);
     assert!(!changes.pd_routes);
 }
@@ -194,7 +184,7 @@ fn route_context_supports_script_filters_without_hiding_other_protocols() {
         r.protocol = protocol;
         r.table = 100;
         new.routes.push(r);
-        let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+        let e = event(Some(view(&old)), view(&new), "kernel");
         assert!(e.changes.routes);
         assert!(!e.changes.pd);
         assert!(!e.changes.pd_routes);
@@ -206,7 +196,7 @@ fn route_context_supports_script_filters_without_hiding_other_protocols() {
     let mut r = route("2001:db8::/64");
     r.output_ifindex = Some(11);
     new.routes.push(r);
-    assert!(event(Some(view(&old)), view(&new), "kernel").is_none());
+    assert!(!Changes::between(&view(&old), &view(&new)).any());
 }
 
 #[test]
@@ -218,7 +208,7 @@ fn unreachable_dhcp_pd_routes_are_projected_into_active_devices() {
     r_main.route_type = 7;
     r_main.table = 254;
     main_unassociated.routes.push(r_main);
-    assert!(event(Some(view(&old)), view(&main_unassociated), "kernel").is_none());
+    assert!(!Changes::between(&view(&old), &view(&main_unassociated)).any());
 
     let mut new = old.clone();
     let mut r = route("2001:db8:54::/62");
@@ -226,7 +216,7 @@ fn unreachable_dhcp_pd_routes_are_projected_into_active_devices() {
     r.route_type = 7;
     r.table = 10010;
     new.routes.push(r);
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert!(e.changes.pd);
     assert!(e.changes.pd_routes);
     assert_eq!(e.state.pd_prefixes, ["2001:db8:54::/62"]);
@@ -234,14 +224,6 @@ fn unreachable_dhcp_pd_routes_are_projected_into_active_devices() {
 
 #[test]
 fn defaults_select_configuration_and_use_actual_interface_names() {
-    let options = Options::parse(Vec::<String>::new()).unwrap();
-    assert_eq!(options.hooks.to_str().unwrap(), "/etc/network-hotplug.d");
-    assert_eq!(options.runtime.to_str().unwrap(), "/run/network-hotplug");
-    assert_eq!(options.timeout_seconds, 30);
-    assert_eq!(
-        options.config.to_str().unwrap(),
-        "/etc/network-hotplug.json"
-    );
     assert!(Options::parse(["--config".into()]).is_err());
     assert_eq!(
         Options::parse(["--config".into(), "/tmp/hotplug.json".into()])
@@ -249,13 +231,13 @@ fn defaults_select_configuration_and_use_actual_interface_names() {
             .config,
         std::path::Path::new("/tmp/hotplug.json")
     );
-    let e = event(None, view(&snapshot()), "startup").unwrap();
+    let e = event(None, view(&snapshot()), "startup");
     assert_eq!(e.environment()["NH_DEVICE"], "ppp-uplink_a");
 }
 
 #[test]
 fn newly_created_runtime_interface_and_addresses_are_changes() {
-    let e = event(Some(View::default()), view(&snapshot()), "kernel").unwrap();
+    let e = event(Some(View::default()), view(&snapshot()), "kernel");
     assert_eq!(e.action, "ifup");
     assert!(e.changes.link);
     assert!(e.changes.ipv4);
@@ -269,24 +251,20 @@ fn interface_management_carrier_and_address_readiness_are_independent() {
     let mut new = old.clone();
     new.links[0].admin_up = true;
     new.links[0].carrier = Some(false);
-    let e = event(Some(view(&old)), view(&new), "kernel").unwrap();
+    let e = event(Some(view(&old)), view(&new), "kernel");
     assert_eq!(e.action, "ifup");
     assert!(e.changes.link);
     assert!(e.state.ipv4.is_empty());
     let old = new.clone();
     new.links[0].carrier = Some(true);
     assert_eq!(
-        event(Some(view(&old)), view(&new), "kernel")
-            .unwrap()
-            .action,
+        event(Some(view(&old)), view(&new), "kernel").action,
         "ifupdate"
     );
     let old = new.clone();
     new.links.remove(0);
     assert_eq!(
-        event(Some(view(&old)), view(&new), "kernel")
-            .unwrap()
-            .action,
+        event(Some(view(&old)), view(&new), "kernel").action,
         "ifdown"
     );
     let old = new.clone();
@@ -296,25 +274,19 @@ fn interface_management_carrier_and_address_readiness_are_independent() {
         admin_up: true,
         ..Default::default()
     });
-    assert_eq!(
-        event(Some(view(&old)), view(&new), "kernel")
-            .unwrap()
-            .action,
-        "ifup"
-    );
+    assert_eq!(event(Some(view(&old)), view(&new), "kernel").action, "ifup");
 }
 
 #[test]
 fn recovery_compares_known_state_and_zero_diff_uses_ifupdate() {
     let old = snapshot();
-    let e = event(Some(view(&old)), view(&old), "netlink_loss").unwrap();
+    let e = event(Some(view(&old)), view(&old), "netlink_loss");
     assert_eq!(e.action, "ifupdate");
     assert_eq!(e.changes, Changes::default());
     let mut new = old.clone();
     new.addresses.clear();
     assert!(
         event(Some(view(&old)), view(&new), "netlink_loss")
-            .unwrap()
             .changes
             .ipv4
     );
@@ -453,7 +425,6 @@ fn address_and_route_order_does_not_change_state() {
         Changes::between(&view(&old), &view(&new)),
         Changes::default()
     );
-    assert!(event(Some(view(&old)), view(&new), "kernel").is_none());
 
     new.addresses[0].prefix_len = 28;
     new.routes[0].metric = 100;

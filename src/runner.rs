@@ -213,12 +213,12 @@ fn run_script(
     let mut process = ProcessGroup {
         child,
         group,
-        cleaned: false,
+        terminate_on_drop: true,
     };
     let timeout = Duration::from_secs(options.timeout_seconds);
     loop {
         if let Some(status) = process.child.try_wait()? {
-            process.cleanup();
+            process.terminate_on_drop = false;
             return Ok((status, start.elapsed(), None));
         }
         let elapsed = start.elapsed();
@@ -246,7 +246,7 @@ fn run_script(
                     .min(Duration::from_millis(50));
                 wait_pidfd(pidfd.as_ref(), remain);
             }
-            process.cleanup();
+            process.terminate();
             return Ok((process.child.wait()?, start.elapsed(), Some(reason)));
         }
         let step = (timeout - elapsed).min(Duration::from_millis(50));
@@ -270,21 +270,23 @@ fn terminate_group(group: i32, signal: i32) {
 struct ProcessGroup {
     child: std::process::Child,
     group: i32,
-    cleaned: bool,
+    terminate_on_drop: bool,
 }
 
 impl ProcessGroup {
-    fn cleanup(&mut self) {
-        if !self.cleaned {
+    fn terminate(&mut self) {
+        if self.terminate_on_drop {
             terminate_group(self.group, libc::SIGKILL);
-            self.cleaned = true;
+            self.terminate_on_drop = false;
         }
     }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        self.cleanup();
+        if self.terminate_on_drop {
+            terminate_group(self.group, libc::SIGKILL);
+        }
         let _ = self.child.wait();
     }
 }

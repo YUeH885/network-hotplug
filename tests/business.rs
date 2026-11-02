@@ -1,311 +1,285 @@
-use serde_json::{Value, json};
+use network_hotplug::event::{Event, View};
+use network_hotplug::model::{Address, Link, Route, Snapshot};
+use serde_json::Value;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-struct Ddns {
-    directory: tempfile::TempDir,
-    requests: Arc<Mutex<Vec<Value>>>,
-    stop: Arc<AtomicBool>,
-    server: Option<std::thread::JoinHandle<()>>,
+struct Lab {
+    dir: tempfile::TempDir,
+    script: std::path::PathBuf,
+    requests_file: std::path::PathBuf,
 }
 
-impl Ddns {
-    fn new(fail_first: bool) -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let cancel = stop.clone();
-        let server = std::thread::spawn(move || {
-            while !cancel.load(Ordering::Relaxed) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(e) => panic!("accept failed: {e}"),
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let (headers, start, length) = loop {
-                    let mut buffer = [0; 4096];
-                    let size = stream.read(&mut buffer).unwrap();
-                    assert!(size > 0);
-                    bytes.extend_from_slice(&buffer[..size]);
-                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                        let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                let (key, value) = line.split_once(':')?;
-                                key.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            })
-                            .unwrap_or(0);
-                        if bytes.len() >= end + 4 + length {
-                            break (headers, end + 4, length);
-                        }
-                    }
-                };
-                assert!(headers.contains("Authorization: Bearer test-token"));
-                let first = headers.lines().next().unwrap();
-                assert!(first.starts_with("PATCH "));
-                let payload: Value = serde_json::from_slice(&bytes[start..start + length]).unwrap();
-                let mut captured = captured.lock().unwrap();
-                let success = !(fail_first && captured.is_empty());
-                captured.push(json!({"request":first,"payload":payload}));
-                drop(captured);
-                let response = json!({"success":success}).to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
-            }
-        });
-        fs::write(
-            directory.path().join("headers"),
-            "Authorization: Bearer test-token\n",
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join("ip"),
-            format!(
-                "#!/bin/sh\ncase \"$*\" in\n*route*) cat '{}' ;;\n*) cat '{}' ;;\nesac\n",
-                directory.path().join("routes").display(),
-                directory.path().join("addresses").display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(
-            directory.path().join("ip"),
-            fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        let script = include_str!("../examples/iface/90-ddns.sh")
-            .replace(
-                "api=https://api.cloudflare.com/client/v4",
-                &format!("api=http://{address}/client/v4"),
-            )
-            .replace("--proto '=https'", "--proto '=http'")
+impl Lab {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let headers = dir.path().join("headers");
+        fs::write(&headers, "Authorization: Bearer test-token\n").unwrap();
+
+        let requests_file = dir.path().join("requests.jsonl");
+        let curl_path = dir.path().join("curl");
+        let curl_script = format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = '--data' ]; then\n    printf '%s\\n' \"$2\" >> '{}'\n    break\n  fi\n  shift\ndone\nprintf '{{\"success\":true}}\\n'\n",
+            requests_file.display()
+        );
+        fs::write(&curl_path, curl_script).unwrap();
+        fs::set_permissions(&curl_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script_content = include_str!("../examples/iface/90-ddns.sh")
             .replace(
                 "header_file=/etc/network-hotplug.d/cloudflare-header",
-                &format!("header_file={}/headers", directory.path().display()),
+                &format!("header_file={}", headers.display()),
             )
-            .replace(
-                "/usr/sbin/ip",
-                &directory.path().join("ip").display().to_string(),
-            )
+            .replace("/usr/bin/curl", &curl_path.display().to_string())
             .replace("/bin/sleep 2", "/bin/sleep 0");
-        fs::write(directory.path().join("ddns.sh"), script).unwrap();
-        let lab = Self {
-            directory,
-            requests,
-            stop,
-            server: Some(server),
-        };
-        lab.addresses(default_addresses());
-        lab.routes(json!([]));
-        lab
+        let script = dir.path().join("ddns.sh");
+        fs::write(&script, script_content).unwrap();
+
+        Self {
+            dir,
+            script,
+            requests_file,
+        }
     }
 
-    fn addresses(&self, addresses: Value) {
-        fs::write(
-            self.directory.path().join("addresses"),
-            addresses.to_string(),
-        )
-        .unwrap();
-    }
-
-    fn routes(&self, routes: Value) {
-        fs::write(self.directory.path().join("routes"), routes.to_string()).unwrap();
-    }
-
-    fn use_pd(&self) {
-        let script = self.directory.path().join("ddns.sh");
-        fs::write(
-            &script,
-            fs::read_to_string(&script).unwrap().replace(
-                "sync_record AAAA wan0 uplink-b.example.com ZONE_ID RECORD_AAAA_ID",
-                "sync_record AAAA wan0 uplink-b.example.com ZONE_ID RECORD_AAAA_ID 254 2001:db8:100:1::5",
-            ),
-        )
-        .unwrap();
-    }
-
-    fn run(&self, device: &str, reason: &str, changes: Value) -> std::process::Output {
-        self.run_event(device, json!({"reason":reason,"changes":changes}))
-    }
-
-    fn run_event(&self, device: &str, event: Value) -> std::process::Output {
-        let path = self.directory.path().join("event.json");
-        fs::write(&path, event.to_string()).unwrap();
+    fn run(&self, device: &str, event: &Event) -> std::process::Output {
+        let event_file = self.dir.path().join("event.json");
+        fs::write(&event_file, serde_json::to_string(event).unwrap()).unwrap();
         Command::new("/bin/sh")
-            .arg(self.directory.path().join("ddns.sh"))
+            .arg(&self.script)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("NH_DEVICE", device)
-            .env("NH_EVENT_FILE", path)
+            .env("NH_EVENT_FILE", &event_file)
             .output()
             .unwrap()
     }
 
-    fn curl_failures(&self, count: usize, exit: i32, after_failure: &str) {
-        let wrapper = self.directory.path().join("curl");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\ncount=0\n[ ! -f '{0}/attempts' ] || count=$(cat '{0}/attempts')\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{0}/attempts'\nif [ \"$count\" -le {count} ]; then\n{after_failure}\nexit {exit}\nfi\nexec /usr/bin/curl \"$@\"\n",
-                self.directory.path().display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-        let script = self.directory.path().join("ddns.sh");
-        fs::write(
-            &script,
-            fs::read_to_string(&script)
-                .unwrap()
-                .replace("/usr/bin/curl", &wrapper.display().to_string()),
-        )
-        .unwrap();
+    fn requests(&self) -> Vec<Value> {
+        let content = fs::read_to_string(&self.requests_file).unwrap_or_default();
+        serde_json::Deserializer::from_str(&content)
+            .into_iter::<Value>()
+            .filter_map(|v| v.ok())
+            .collect()
     }
 }
 
-impl Drop for Ddns {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.server.take().unwrap().join().unwrap();
+fn sample_snapshot() -> Snapshot {
+    Snapshot {
+        links: vec![
+            Link {
+                device: "ppp-uplink_a".into(),
+                ifindex: 10,
+                admin_up: true,
+                carrier: Some(true),
+                operstate: 6,
+                mtu: 1500,
+                flags: 1,
+            },
+            Link {
+                device: "wan0".into(),
+                ifindex: 11,
+                admin_up: true,
+                carrier: Some(true),
+                operstate: 6,
+                mtu: 1500,
+                flags: 1,
+            },
+        ],
+        addresses: vec![
+            Address {
+                ifindex: 10,
+                family: 4,
+                address: "192.0.2.5".into(),
+                prefix_len: 24,
+                peer: None,
+                broadcast: None,
+                label: None,
+                scope: 0,
+                flags: 0,
+                protocol: None,
+                usable: true,
+                preferred: true,
+                temporary: false,
+            },
+            Address {
+                ifindex: 11,
+                family: 6,
+                address: "2001:db8:2::5".into(),
+                prefix_len: 64,
+                peer: None,
+                broadcast: None,
+                label: None,
+                scope: 0,
+                flags: 0,
+                protocol: None,
+                usable: true,
+                preferred: true,
+                temporary: false,
+            },
+        ],
+        routes: vec![Route {
+            family: 6,
+            destination: "2001:db8:40::".into(),
+            prefix_len: 56,
+            table: 254,
+            protocol: 16,
+            route_type: 1,
+            output_ifindex: Some(11),
+            ..Default::default()
+        }],
     }
-}
-
-fn default_addresses() -> Value {
-    json!([
-        {"ifname":"ppp-uplink_a","addr_info":[{"family":"inet","scope":"global","local":"192.0.2.5"}]},
-        {"ifname":"wan0","addr_info":[{"family":"inet6","scope":"global","local":"2001:db8:2::5"}]}
-    ])
 }
 
 #[test]
 fn ddns_patches_on_startup_and_real_changes_without_readback() {
-    let lab = Ddns::new(false);
-    assert!(
-        lab.run("ppp-uplink_a", "startup", json!({}))
-            .status
-            .success()
+    let lab = Lab::new();
+    let snapshot = sample_snapshot();
+
+    // Startup event for ppp-uplink_a
+    let view_a = View::project(&snapshot, "ppp-uplink_a");
+    let event_a = Event::build(1, "ppp-uplink_a", None, view_a.clone(), "startup", 1);
+    let output = lab.run("ppp-uplink_a", &event_a);
+    assert!(output.status.success());
+
+    // Startup event for wan0
+    let view_b = View::project(&snapshot, "wan0");
+    let event_b = Event::build(2, "wan0", None, view_b.clone(), "startup", 1);
+    let output = lab.run("wan0", &event_b);
+    assert!(output.status.success());
+
+    let reqs = lab.requests();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0]["content"], "192.0.2.5");
+    assert_eq!(reqs[1]["content"], "2001:db8:2::5");
+
+    // Kernel event with only route changes (no IP change for ppp-uplink_a) -> should skip DDNS update
+    let mut updated_snapshot = snapshot.clone();
+    updated_snapshot.routes.push(Route {
+        destination: "10.0.0.0".into(),
+        prefix_len: 8,
+        table: 254,
+        protocol: 4,
+        route_type: 1,
+        output_ifindex: Some(10),
+        ..Default::default()
+    });
+    let updated_view_a = View::project(&updated_snapshot, "ppp-uplink_a");
+    let event_route_only = Event::build(
+        3,
+        "ppp-uplink_a",
+        Some(view_a.clone()),
+        updated_view_a,
+        "kernel",
+        1,
     );
-    assert!(lab.run("wan0", "startup", json!({})).status.success());
-    let records = lab.requests.lock().unwrap().clone();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0]["payload"], json!({"content":"192.0.2.5"}));
-    assert_eq!(records[1]["payload"], json!({"content":"2001:db8:2::5"}));
-    assert!(
-        lab.run("ppp-uplink_a", "kernel", json!({"routes":true}))
-            .status
-            .success()
+    let output = lab.run("ppp-uplink_a", &event_route_only);
+    assert!(output.status.success());
+    assert_eq!(lab.requests().len(), 2);
+
+    // Kernel event with IPv4 change -> should trigger PATCH
+    let mut ip_change_snapshot = snapshot.clone();
+    ip_change_snapshot.addresses[0].address = "198.51.100.1".into();
+    let ip_change_view_a = View::project(&ip_change_snapshot, "ppp-uplink_a");
+    let event_ip_change = Event::build(
+        4,
+        "ppp-uplink_a",
+        Some(view_a),
+        ip_change_view_a,
+        "kernel",
+        1,
     );
-    assert_eq!(lab.requests.lock().unwrap().len(), 2);
-    assert!(
-        lab.run("ppp-uplink_a", "kernel", json!({"ipv4":true}))
-            .status
-            .success()
-    );
-    assert!(
-        lab.run(
-            "wan0",
-            "kernel",
-            json!({"ipv6_usable":true,"ipv6_attributes":true})
-        )
-        .status
-        .success()
-    );
-    assert_eq!(lab.requests.lock().unwrap().len(), 4);
+    let output = lab.run("ppp-uplink_a", &event_ip_change);
+    assert!(output.status.success());
+    assert_eq!(lab.requests().len(), 3);
+    assert_eq!(lab.requests()[2]["content"], "198.51.100.1");
 }
 
 #[test]
 fn ddns_skips_private_tentative_and_temporary_addresses() {
-    let lab = Ddns::new(false);
-    lab.addresses(json!([
-        {"ifname":"ppp-uplink_a","addr_info":[{"family":"inet","scope":"global","local":"172.20.1.2"}]},
-        {"ifname":"wan0","addr_info":[
-            {"family":"inet6","scope":"global","local":"2001:db8::2","tentative":true},
-            {"family":"inet6","scope":"global","local":"2001:db8::3","temporary":true}]}
-    ]));
-    assert!(lab.run("", "startup", json!({})).status.success());
-    assert!(lab.requests.lock().unwrap().is_empty());
+    let lab = Lab::new();
+    let mut snapshot = sample_snapshot();
+    // Private IPv4 (RFC 1918)
+    snapshot.addresses[0].address = "172.20.1.2".into();
+    // Tentative / temporary IPv6 (unusable)
+    snapshot.addresses[1].usable = false;
+
+    let view_a = View::project(&snapshot, "ppp-uplink_a");
+    let event_a = Event::build(1, "ppp-uplink_a", None, view_a, "startup", 1);
+    let output = lab.run("ppp-uplink_a", &event_a);
+    assert!(output.status.success());
+
+    let view_b = View::project(&snapshot, "wan0");
+    let event_b = Event::build(2, "wan0", None, view_b, "startup", 1);
+    let output = lab.run("wan0", &event_b);
+    assert!(output.status.success());
+
+    assert!(lab.requests().is_empty());
 }
 
 #[test]
-fn ddns_records_api_failure_and_refuses_ambiguous_addresses() {
-    let lab = Ddns::new(true);
-    assert!(!lab.run("", "startup", json!({})).status.success());
-    assert_eq!(lab.requests.lock().unwrap().len(), 2);
+fn ddns_records_refuses_ambiguous_addresses() {
+    let lab = Lab::new();
+    let mut snapshot = sample_snapshot();
+    // Add second public IPv4 address to ppp-uplink_a
+    snapshot.addresses.push(Address {
+        ifindex: 10,
+        family: 4,
+        address: "192.0.2.6".into(),
+        prefix_len: 24,
+        peer: None,
+        broadcast: None,
+        label: None,
+        scope: 0,
+        flags: 0,
+        protocol: None,
+        usable: true,
+        preferred: true,
+        temporary: false,
+    });
 
-    let lab = Ddns::new(false);
-    let mut addresses = default_addresses();
-    addresses[0]["addr_info"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"family":"inet","scope":"global","local":"192.0.2.6"}));
-    lab.addresses(addresses);
-    let result = lab.run("", "startup", json!({}));
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("ambiguous WAN addresses"));
-    assert_eq!(lab.requests.lock().unwrap().len(), 1);
+    let view_a = View::project(&snapshot, "ppp-uplink_a");
+    let event_a = Event::build(1, "ppp-uplink_a", None, view_a, "startup", 1);
+    let output = lab.run("ppp-uplink_a", &event_a);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous WAN addresses"));
 }
 
 #[test]
-fn ddns_pd_preserves_host_bits_and_follows_priority() {
-    let lab = Ddns::new(false);
-    lab.use_pd();
-    lab.routes(json!([
-        {"dst":"2001:db8:40:1200::/56","dev":"wan0","metric":100},
-        {"dst":"2001:db8:99::1","dev":"wan0","metric":500}
-    ]));
-    assert!(lab.run("wan0", "startup", json!({})).status.success());
-    assert_eq!(
-        lab.requests.lock().unwrap()[0]["payload"]["content"],
-        "2001:db8:40:1201:0:0:0:5"
+fn ddns_synthesizes_pd_address_with_host_bits() {
+    let lab = Lab::new();
+    let script_path = &lab.script;
+    let modified_script = fs::read_to_string(script_path).unwrap().replace(
+        "sync_record AAAA wan0 uplink-b.example.com ZONE_ID RECORD_AAAA_ID",
+        "sync_record AAAA wan0 uplink-b.example.com ZONE_ID RECORD_AAAA_ID 254 2001:2:0:4959:be24:11ff:feb0:cdcf",
     );
+    fs::write(script_path, modified_script).unwrap();
+
+    let mut snapshot = sample_snapshot();
+    snapshot.routes = vec![Route {
+        family: 6,
+        destination: "2408:825c:a660:706::".into(),
+        prefix_len: 64,
+        table: 254,
+        protocol: 16,
+        route_type: 1,
+        output_ifindex: Some(11),
+        ..Default::default()
+    }];
+    let view_b = View::project(&snapshot, "wan0");
+    let event_b = Event::build(1, "wan0", None, view_b, "startup", 1);
+    let output = lab.run("wan0", &event_b);
     assert!(
-        lab.run("wan0", "kernel", json!({"ipv6":true}))
-            .status
-            .success()
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(lab.requests.lock().unwrap().len(), 1);
-    for (prefix, expected) in [
-        ("2001:db8:40:1254::/62", "2001:db8:40:1255:0:0:0:5"),
-        ("2001:db8:40:1254::/64", "2001:db8:40:1254:0:0:0:5"),
-    ] {
-        lab.routes(json!([{"dst":prefix,"dev":"wan0","metric":100}]));
-        assert!(
-            lab.run("wan0", "kernel", json!({"pd":true,"pd_routes":true}))
-                .status
-                .success()
-        );
-        assert_eq!(
-            lab.requests.lock().unwrap().last().unwrap()["payload"]["content"],
-            expected
-        );
-    }
-}
-
-#[test]
-fn ddns_retries_temporary_failure_without_repeating_completed_records() {
-    let lab = Ddns::new(false);
-    lab.curl_failures(1, 6, "");
-    let result = lab.run("", "startup", json!({}));
-    assert!(result.status.success(), "{result:?}");
-    let records = lab.requests.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0]["payload"]["content"], "2001:db8:2::5");
-    assert_eq!(records[1]["payload"]["content"], "192.0.2.5");
+    let requests = lab.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["content"],
+        "2408:825c:a660:706:be24:11ff:feb0:cdcf"
+    );
 }

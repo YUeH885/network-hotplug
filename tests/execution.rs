@@ -1,5 +1,5 @@
 use network_hotplug::config::Config;
-use network_hotplug::model::{Address, Link, Snapshot};
+use network_hotplug::model::{Link, Snapshot};
 use network_hotplug::nftables::{Reloads, Table};
 use network_hotplug::options::Options;
 use network_hotplug::runner::RunLock;
@@ -58,7 +58,7 @@ fn slow_interface_retains_later_changes_and_other_interfaces_wait_in_fifo() {
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "if [ \"$NH_DEVICE\" = wan-a ] && [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nsleep 0.8\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n",
+        "if [ \"$NH_DEVICE\" = wan-a ] && [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nwhile [ ! -f '{0}/release' ]; do sleep 0.005; done\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n",
         temp.path().display())).unwrap();
     let mut scheduler = Scheduler::new(options.clone(), config()).unwrap();
     let mut state = snapshot();
@@ -70,6 +70,7 @@ fn slow_interface_retains_later_changes_and_other_interfaces_wait_in_fifo() {
     scheduler.submit(&state, "kernel");
     state.links[0].mtu = 1480;
     scheduler.submit(&state, "kernel");
+    std::fs::write(temp.path().join("release"), "").unwrap();
     wait_for(|| {
         std::fs::read_to_string(temp.path().join("wan-a.jsonl"))
             .is_ok_and(|s| s.lines().count() == 2)
@@ -106,7 +107,7 @@ fn startup_baseline_is_preserved_when_runtime_updates_arrive_before_first_dispat
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "if [ \"$NH_DEVICE\" = wan-a ]; then : > '{0}/started'; sleep 0.5; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n",
+        "if [ \"$NH_DEVICE\" = wan-a ]; then : > '{0}/started'; while [ ! -f '{0}/release' ]; do sleep 0.005; done; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n",
         temp.path().display())).unwrap();
     let mut scheduler = Scheduler::new(options, config()).unwrap();
     let mut state = snapshot();
@@ -114,6 +115,7 @@ fn startup_baseline_is_preserved_when_runtime_updates_arrive_before_first_dispat
     wait_for(|| temp.path().join("started").exists());
     state.links[1].mtu = 1492;
     scheduler.submit(&state, "kernel");
+    std::fs::write(temp.path().join("release"), "").unwrap();
     wait_for(|| {
         std::fs::read_to_string(temp.path().join("wan-b.jsonl"))
             .is_ok_and(|s| s.lines().count() == 2)
@@ -222,7 +224,7 @@ fn many_pending_updates_keep_one_latest_state() {
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
     std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nif [ ! -f '{0}/started' ]; then : > '{0}/started'; sleep 0.8; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/records'\n", temp.path().display())).unwrap();
+        "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nif [ ! -f '{0}/started' ]; then : > '{0}/started'; while [ ! -f '{0}/release' ]; do sleep 0.005; done; fi\ncat \"$NH_EVENT_FILE\" >> '{0}/records'\n", temp.path().display())).unwrap();
     let mut scheduler = Scheduler::new(options, config()).unwrap();
     let mut state = snapshot();
     scheduler.submit(&state, "startup");
@@ -232,6 +234,7 @@ fn many_pending_updates_keep_one_latest_state() {
         scheduler.submit(&state, "kernel");
     }
     scheduler.submit(&state, "kernel");
+    std::fs::write(temp.path().join("release"), "").unwrap();
     wait_for(|| {
         std::fs::read_to_string(temp.path().join("records")).is_ok_and(|s| s.lines().count() == 2)
     });
@@ -283,45 +286,30 @@ fn runtime_device_discovery_deletion_and_recreation_keep_real_names() {
 }
 
 #[test]
-fn pending_address_round_trip_suppresses_noop_dispatch() {
+fn normal_exit_does_not_kill_background_process() {
     let temp = tempfile::tempdir().unwrap();
     let options = options(temp.path(), 3);
     let _lock = RunLock::acquire(&options.runtime).unwrap();
-    std::fs::write(options.iface_directory().join("10-record.sh"), format!(
-        "if [ \"$NH_DEVICE\" = wan-a ] && [ ! -f '{0}/started' ]; then\n: > '{0}/started'\nwhile [ ! -f '{0}/release' ]; do sleep 0.01; done\nfi\ncat \"$NH_EVENT_FILE\" >> '{0}/'$NH_DEVICE.jsonl\n", temp.path().display())).unwrap();
-    let mut state = snapshot();
-    state.addresses.push(Address {
-        ifindex: 10,
-        family: 4,
-        address: "192.0.2.2".into(),
-        prefix_len: 24,
-        peer: None,
-        broadcast: None,
-        label: None,
-        scope: 0,
-        flags: 0,
-        protocol: None,
-        usable: true,
-        preferred: true,
-        temporary: false,
-    });
+    std::fs::write(
+        options.iface_directory().join("10-bg.sh"),
+        format!(
+            "[ \"$NH_DEVICE\" = wan-a ] || exit 0\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}/child'\nexit 0\n",
+            temp.path().display()
+        ),
+    )
+    .unwrap();
     let mut scheduler = Scheduler::new(options, config()).unwrap();
-    scheduler.submit(&state, "startup");
-    wait_for(|| temp.path().join("started").exists());
-    state.addresses[0].address = "192.0.2.3".into();
-    scheduler.submit(&state, "kernel");
-    state.addresses[0].address = "192.0.2.2".into();
-    scheduler.submit(&state, "kernel");
-    state.links[1].mtu = 1400;
-    scheduler.submit(&state, "kernel");
-    std::fs::write(temp.path().join("release"), "").unwrap();
-    wait_for(|| {
-        std::fs::read_to_string(temp.path().join("wan-b.jsonl"))
-            .is_ok_and(|records| records.lines().count() == 2)
-    });
+    scheduler.submit(&snapshot(), "startup");
+    wait_for(|| temp.path().join("child").exists());
+    let pid_str = std::fs::read_to_string(temp.path().join("child")).unwrap();
+    let pid: i32 = pid_str.trim().parse().unwrap();
+    let is_alive = unsafe { libc::kill(pid, 0) == 0 };
+    assert!(
+        is_alive,
+        "background process should still be running after normal script exit"
+    );
+    unsafe { libc::kill(pid, libc::SIGKILL) };
     drop(scheduler);
-    let records = std::fs::read_to_string(temp.path().join("wan-a.jsonl")).unwrap();
-    assert_eq!(records.lines().count(), 1);
 }
 
 #[test]

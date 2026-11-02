@@ -19,8 +19,7 @@ struct Work {
 }
 
 struct Slot {
-    observed: View,
-    delivered: Option<View>,
+    current: Option<View>,
     startup: Option<Work>,
     pending: Option<Work>,
     scheduled: bool,
@@ -29,8 +28,7 @@ struct Slot {
 impl Default for Slot {
     fn default() -> Self {
         Self {
-            observed: View::default(),
-            delivered: Some(View::default()),
+            current: Some(View::default()),
             startup: None,
             pending: None,
             scheduled: false,
@@ -86,22 +84,26 @@ impl Scheduler {
         for (device, slot) in &mut queue.slots {
             let new = View::project(snapshot, device);
             if !self.initialized {
-                slot.observed = new.clone();
                 if new.link.is_none() {
                     continue;
                 }
-                slot.delivered = None;
+                slot.current = None;
                 slot.startup = Some(Work {
                     view: new,
                     reason: "startup".into(),
                     count: 1,
                 });
             } else {
-                let changed = Changes::between(&slot.observed, &new).any();
-                if !changed && (reason == "kernel" || new.link.is_none() && !slot.scheduled) {
+                let current_view = slot
+                    .pending
+                    .as_ref()
+                    .map(|w| &w.view)
+                    .or(slot.startup.as_ref().map(|w| &w.view))
+                    .or(slot.current.as_ref());
+                let changed = current_view.is_none_or(|v| Changes::between(v, &new).any());
+                if !changed && reason == "kernel" {
                     continue;
                 }
-                slot.observed = new.clone();
                 if let Some(pending) = &mut slot.pending {
                     pending.view = new;
                     pending.count += 1;
@@ -176,28 +178,24 @@ fn worker(options: &Options, shared: &(Mutex<Queue>, Condvar), stop: &AtomicBool
             }
             queue.ready.pop_front().unwrap()
         };
-        let dispatched = match &lane {
+        match &lane {
             Lane::Network(device) => {
                 let (work, previous) = {
                     let mut queue = shared.0.lock().unwrap();
                     let slot = queue.slots.get_mut(device).unwrap();
                     let work = slot.startup.take().or_else(|| slot.pending.take()).unwrap();
-                    let previous = slot.delivered.replace(work.view.clone());
+                    let previous = slot.current.replace(work.view.clone());
                     (work, previous)
                 };
-                if let Some(event) = Event::build(
+                let event = Event::build(
                     next_id,
                     device,
                     previous,
                     work.view,
                     &work.reason,
                     work.count,
-                ) {
-                    run_hook(options, &options.iface_directory(), &event, stop);
-                    true
-                } else {
-                    false
-                }
+                );
+                run_hook(options, &options.iface_directory(), &event, stop);
             }
             Lane::Nftables => {
                 let reload = {
@@ -213,12 +211,9 @@ fn worker(options: &Options, shared: &(Mutex<Queue>, Condvar), stop: &AtomicBool
                 };
                 let event = ReloadEvent::new(next_id, &reload);
                 run_hook(options, &options.nftables_directory(), &event, stop);
-                true
             }
         };
-        if dispatched {
-            next_id += 1;
-        }
+        next_id += 1;
         let mut queue = shared.0.lock().unwrap();
         let pending = match &lane {
             Lane::Network(device) => {
